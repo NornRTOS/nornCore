@@ -60,3 +60,9 @@ uint32_t board_appTimerElapsed(void)
     TIMG0_T0UPDATE = 1;                 /* latch the counter into T0LO/T0HI */
     return TIMG0_T0LO;
 }
+
+
+void board_hiresTimerSetPeriod(uint32_t counts)
+{
+    TIMG0_T0ALARMLO = counts;           /* the counter restarted at 0 on the alarm */
+}

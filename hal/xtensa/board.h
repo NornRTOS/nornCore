@@ -11,6 +11,7 @@
  */
 
 #include "gpio.h"
+#include "port.h"
 
 #define BOARD_NAME      "ESP32"
 #define BOARD_IS_ESP32  1
@@ -32,5 +33,21 @@ void board_appTimerStart(uint32_t hz);
     BOARD_APP_TIMER_COUNT_HZ counts per second. */
 #define BOARD_APP_TIMER_COUNT_HZ    (HAL_APB_HZ / BOARD_APP_TIMER_PRESCALER)
 uint32_t board_appTimerElapsed(void);
+
+/* Cycle counter and high resolution probe timer for the kernel benchmark (tc10): the
+   CPU's CCOUNT register, and the application timer, whose 40 MHz counter is fine enough
+   to serve as the probe as well. The two must not be used together with the app timer. */
+#define BOARD_HAS_CYCLE_COUNTER     1
+#define BOARD_CYCLES_HZ             F_CPU
+#define BOARD_CYCLES_MASK           0xFFFFFFFFul
+static inline void board_cycleCounterStart(void) { }
+static inline uint32_t board_cycles(void) { return rtos_port_ccount(); }
+
+#define BOARD_HIRES_TIMER_VECT              BOARD_APP_TIMER_VECT
+#define BOARD_HIRES_TIMER_COUNT_HZ          BOARD_APP_TIMER_COUNT_HZ
+#define BOARD_HIRES_TIMER_HZ_IS_EXACT(hz)   BOARD_APP_TIMER_HZ_IS_EXACT(hz)
+#define board_hiresTimerStart(hz)           board_appTimerStart(hz)
+#define board_hiresTimerElapsed()           board_appTimerElapsed()
+void board_hiresTimerSetPeriod(uint32_t counts);
 
 #endif  /* BOARD_INCLUDED */

@@ -37,8 +37,7 @@ static bool enqueue(rtos_queue_t *pQ, const void *pItem)
 {
     if(pQ->readers != 0)
     {
-        const uint8_t id = rtos_kernel_releaseHighestWaiter(&pQ->readers);
-        memcpy(rtos_tcbAry[id].pXfer, pItem, pQ->itemSize);
+        memcpy(rtos_kernel_releaseHighestWaiter(&pQ->readers)->pXfer, pItem, pQ->itemSize);
         return true;
     }
     if(pQ->count >= pQ->capacity)
@@ -71,8 +70,7 @@ static bool dequeue(rtos_queue_t *pQ, void *pItem)
 
     if(pQ->writers != 0)
     {
-        const uint8_t id = rtos_kernel_releaseHighestWaiter(&pQ->writers);
-        memcpy(slot(pQ, pQ->tail), rtos_tcbAry[id].pXfer, pQ->itemSize);
+        memcpy(slot(pQ, pQ->tail), rtos_kernel_releaseHighestWaiter(&pQ->writers)->pXfer, pQ->itemSize);
         if(++pQ->tail >= pQ->capacity)
             pQ->tail = 0;
         ++ pQ->count;
@@ -187,8 +185,7 @@ bool rtos_mboxPostFromIsr(rtos_mbox_t *pMb, const void *pItem)
 
     if(pMb->readers != 0)
     {
-        const uint8_t id = rtos_kernel_releaseHighestWaiter(&pMb->readers);
-        memcpy(rtos_tcbAry[id].pXfer, pItem, pMb->itemSize);
+        memcpy(rtos_kernel_releaseHighestWaiter(&pMb->readers)->pXfer, pItem, pMb->itemSize);
     }
     else
     {

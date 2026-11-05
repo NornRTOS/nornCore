@@ -10,6 +10,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-avr avr-libc simavr python3-serial
       - name: Host unit tests (ASan, UBSan)
         run: make host-test
+      - name: Static analysis (gcc -fanalyzer, host and AVR)
+        run: make analyze
+      - name: Kernel line coverage of the host tests
+        run: make host-cov
       - name: AVR boards in simavr
         run: ESP_PORT= QEMU_ESP=/nonexistent ESP_PYTHON=python3 tools/test_all.sh
 

@@ -1,12 +1,8 @@
 /**
  * @file port_avr.c
  * AVR port: tick timer on a 16 bit timer in CTC mode, stack preparation and the
- * microsecond clock.
- *
- * Timer selection: RTOS_CFG_TIMER is one of the 16 bit timers of the MCU: 1, 3, 4 or 5 on
- * the ATmega2560, only 1 on the ATmega328P. Left undefined it defaults to 3 where that
- * exists (keeps timer 1 free for PWM on the Mega) and to 1 otherwise. The prescaler is 64,
- * so the tick frequency must divide F_CPU/64 exactly; at 16 MHz and 1 kHz this gives
+ * microsecond clock. The timer is selected in port.h (RTOS_CFG_TIMER); the prescaler is
+ * 64, so the tick frequency must divide F_CPU/64 exactly; at 16 MHz and 1 kHz this gives
  * OCRnA = 249 and a counter resolution of 4 us.
  */
 
@@ -19,34 +15,8 @@
  * Defines
  */
 
-#ifndef RTOS_CFG_TIMER
-# if defined(TCCR3A)
-#  define RTOS_CFG_TIMER 3
-# else
-#  define RTOS_CFG_TIMER 1
-# endif
-#endif
-
-#define CAT2_(a, b)       a##b
-#define CAT2(a, b)        CAT2_(a, b)
-#define CAT3_(a, b, c)    a##b##c
-#define CAT3(a, b, c)     CAT3_(a, b, c)
-
-#define TCCRnA      CAT3(TCCR, RTOS_CFG_TIMER, A)
-#define TCCRnB      CAT3(TCCR, RTOS_CFG_TIMER, B)
-#define TCNTn       CAT2(TCNT, RTOS_CFG_TIMER)
-#define OCRnA       CAT3(OCR,  RTOS_CFG_TIMER, A)
-#define TIMSKn      CAT2(TIMSK, RTOS_CFG_TIMER)
-#define TIFRn       CAT2(TIFR, RTOS_CFG_TIMER)
-#define OCIEnA      CAT3(OCIE, RTOS_CFG_TIMER, A)
-#define OCFnA       CAT3(OCF,  RTOS_CFG_TIMER, A)
-#define WGMn2       CAT3(WGM,  RTOS_CFG_TIMER, 2)
-#define CSn1        CAT3(CS,   RTOS_CFG_TIMER, 1)
-#define CSn0        CAT3(CS,   RTOS_CFG_TIMER, 0)
-#define TICK_VECT   CAT3(TIMER, RTOS_CFG_TIMER, _COMPA_vect)
-
-#define PRESCALER   64ul
-#define TIMER_TOP   (F_CPU / PRESCALER / RTOS_CFG_TICK_HZ - 1ul)
+#define PRESCALER   RTOS_PORT_TIMER_PRESCALER
+#define TIMER_TOP   RTOS_PORT_TIMER_TOP
 #define US_PER_COUNT (PRESCALER * 1000000ul / F_CPU)
 #define US_PER_TICK  (1000000ul / RTOS_CFG_TICK_HZ)
 
@@ -167,19 +137,25 @@ void rtos_port_wdtKick(void)
 
 void rtos_port_startTimer(void)
 {
-    TCCRnA = 0;
-    TCCRnB = 0;
-    TCNTn  = 0;
-    OCRnA  = (uint16_t)TIMER_TOP;
-    TIFRn  = _BV(OCFnA);
-    TCCRnB = _BV(WGMn2) | _BV(CSn1) | _BV(CSn0);
-    TIMSKn = _BV(OCIEnA);
+    RTOS_PORT_TCCRnA = 0;
+    RTOS_PORT_TCCRnB = 0;
+    RTOS_PORT_TCNTn  = 0;
+    RTOS_PORT_OCRnA  = (uint16_t)TIMER_TOP;
+    RTOS_PORT_TIFRn  = _BV(RTOS_PORT_OCFnA);
+    RTOS_PORT_TCCRnB = _BV(RTOS_PORT_WGMn2) | _BV(RTOS_PORT_CSn1) | _BV(RTOS_PORT_CSn0);
+    RTOS_PORT_TIMSKn = _BV(RTOS_PORT_OCIEnA);
 }
 
 
+/** Run time counter value at the last tick: the tick ISR adds one tick period, so
+    rtos_port_getRunTimeCounter is an addition instead of a 32 bit multiplication. */
+rtos_port_runtime_t rtos_port_runBase = 0;
+
+
 /** The tick interrupt. */
-RTOS_ISR(TICK_VECT)
+RTOS_ISR(RTOS_PORT_TICK_VECT)
 {
+    rtos_port_runBase += TIMER_TOP + 1ul;
     rtos_tickFromIsr();
 }
 
@@ -191,30 +167,15 @@ uint32_t rtos_getTimeUs(void)
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
     t = rtos_getTick();
-    cnt = TCNTn;
-    if(TIFRn & _BV(OCFnA))
+    cnt = RTOS_PORT_TCNTn;
+    if(RTOS_PORT_TIFRn & _BV(RTOS_PORT_OCFnA))
     {
         /* A tick is pending but not yet counted. */
         ++ t;
-        cnt = TCNTn;
+        cnt = RTOS_PORT_TCNTn;
     }
     rtos_port_exitCritical(cs);
     return (uint32_t)t * US_PER_TICK + (uint32_t)cnt * US_PER_COUNT;
-}
-
-
-rtos_port_runtime_t rtos_port_getRunTimeCounter(void)
-{
-    rtos_tick_t t = rtos_tickCount;
-    uint16_t cnt = TCNTn;
-
-    if(TIFRn & _BV(OCFnA))
-    {
-        /* A tick is pending but not yet counted. */
-        ++ t;
-        cnt = TCNTn;
-    }
-    return (uint32_t)t * (TIMER_TOP + 1ul) + cnt;
 }
 
 

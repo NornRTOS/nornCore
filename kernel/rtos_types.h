@@ -63,6 +63,35 @@
 #ifndef RTOS_CFG_TICKLESS
 # define RTOS_CFG_TICKLESS 0
 #endif
+#ifndef RTOS_CFG_NOTIFY
+# define RTOS_CFG_NOTIFY 1                  /* task notifications (rtos_notify*) */
+#endif
+#ifndef RTOS_CFG_STACK_WARN
+# define RTOS_CFG_STACK_WARN 1              /* idle task stack monitor (needs STACK_CHECK) */
+#endif
+
+/** Every option that changes the kernel's data layout or behaviour, folded into one
+    number. rtos_init passes the application's value to the kernel, which compares it with
+    its own: a kernel library built for another configuration profile is caught at start
+    (RTOS_PANIC_CONFIG) instead of corrupting memory. */
+#define RTOS_CONFIG_SIGNATURE                                                       \
+    ( (uint32_t)(RTOS_CFG_NUM_TASKS & 31u)                                          \
+    | ((uint32_t)(RTOS_CFG_TICK_BITS / 16u) << 5)                                   \
+    | ((uint32_t)(RTOS_CFG_EVT_BITS / 8u) << 7)                                     \
+    | ((uint32_t)(RTOS_CFG_STACK_CHECK & 3u) << 10)                                 \
+    | ((uint32_t)(RTOS_CFG_RUNTIME_STATS != 0) << 12)                               \
+    | ((uint32_t)(RTOS_CFG_SW_TIMERS != 0) << 13)                                   \
+    | ((uint32_t)(RTOS_CFG_NOTIFY != 0) << 14)                                      \
+    | ((uint32_t)(RTOS_CFG_EVGROUPS != 0) << 15)                                    \
+    | ((uint32_t)(RTOS_CFG_SUSPEND != 0) << 16)                                     \
+    | ((uint32_t)(RTOS_CFG_HEAP != 0) << 17)                                        \
+    | ((uint32_t)(RTOS_CFG_WATCHDOG != 0) << 18)                                    \
+    | ((uint32_t)(RTOS_CFG_TIMER_TASK_PRIO & 31u) << 19)                            \
+    | ((uint32_t)(RTOS_CFG_TRACE != 0) << 24)                                       \
+    | ((uint32_t)(RTOS_CFG_STACK_WARN != 0) << 25)                                  \
+    | ((uint32_t)(RTOS_CFG_TICKLESS != 0) << 26)                                    \
+    | ((uint32_t)(RTOS_CFG_PANIC_ACTION != 0) << 27)                                \
+    | ((uint32_t)((RTOS_CFG_TICK_HZ / 100ul) & 15ul) << 28) )
 
 /** Bitmask with one bit per task. Sized to the smallest integer that fits. */
 #if RTOS_CFG_NUM_TASKS + 1 <= 8

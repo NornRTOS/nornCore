@@ -18,6 +18,7 @@ PORT   ?= /dev/ttyACM0
 
 CC      = avr-gcc
 OBJCOPY = avr-objcopy
+AR      = avr-ar
 SIZE    = avr-size
 
 CFLAGS  = -std=c99 -pedantic -Wall -Wextra -Wshadow -Wundef -Wstrict-prototypes \

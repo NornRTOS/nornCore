@@ -10,8 +10,10 @@ make fragment; the AVR port (`port/avr/`) is the smallest complete example, the 
 
 | Name | Meaning |
 |---|---|
-| `RTOS_PORT_MIN_STACK` | Smallest task stack the port accepts: interrupt frame plus one switch frame plus some calls. |
+| `RTOS_PORT_MIN_STACK` | Smallest task stack the port accepts: interrupt frame plus one switch frame plus some calls. Measure it with applications/tc11 (stack left by a task that only blocks, by one woken from an interrupt, by one interrupted while running) and leave room for a frame or two of the task's own. |
 | `RTOS_PORT_STACK_ALIGN` | Alignment of stack frames in the ABI (1 on AVR, 16 on Xtensa). |
+| `RTOS_PORT_DEFAULT_STACK`, `RTOS_PORT_LARGE_STACK` | Recommended starting sizes for an ordinary and for a complex task (README "Stacks"), neither an upper bound; exported as RTOS_STACK_DEFAULT / RTOS_STACK_LARGE. |
+| `RTOS_PORT_STACK_WARN` | Margin in bytes below which the idle stack monitor warns: about what the next interrupt or nested call needs. |
 | `RTOS_PORT_WEAK` | Attribute for overridable functions, normally `__attribute__((weak))`. |
 | `RTOS_PORT_NOINIT` | Attribute placing data where a reset does not clear it (the panic record). |
 | `RTOS_PORT_STR(s)` | String literal in program memory (`PSTR` on AVR, identity elsewhere). |
@@ -33,7 +35,8 @@ Functions, inline or not:
 | `rtos_port_reset` | Reset the system; `noreturn`. |
 | `rtos_port_getResetCause` | One of `RTOS_RESET_*` for the last reset. |
 | `rtos_port_switchContext` | Called with interrupts masked, in task or interrupt context: save what the ABI says a callee preserves plus the stack pointer into `rtos_pCurrent->ctx`, set `rtos_pCurrent = rtos_pNext`, load its stack pointer and return into it. |
-| `rtos_port_initStack(area, size, entry)` | Prepare a stack so that the first switch into it starts `entry` (always `rtos_taskTrampoline`) with interrupts masked; the trampoline enables them. Return the initial `ctx`. |
+| `RTOS_PORT_INLINE_SCHEDULE` | Optional, define as 1 to inline the scheduler into the blocking path (one call level and frame less per blocking call; worth it on Xtensa, not on the AVR). The interrupt epilogue may likewise call `rtos_kernel_isrTailInline` instead of `rtos_isrTail` to switch from its own frame. |
+| `rtos_port_initStack(area, size, entry)` | Prepare a stack so that the first switch into it starts `entry` (always `rtos_taskTrampoline`) with interrupts masked; the trampoline enables them. Return the initial `ctx`. A port whose frames are expensive may instead run the three start steps itself (`rtos_kernel_taskStarting`, `rtos_kernel_taskStartArg`, `rtos_kernel_taskExit` in rtos_kernel.h) from a frameless stub. |
 | `rtos_port_startTimer` | Start the tick at `RTOS_CFG_TICK_HZ`; the interrupt calls `rtos_tickFromIsr` and then the ISR tail. |
 | `rtos_port_getRunTimeCounter` | Free running time at `RTOS_PORT_RUNTIME_HZ`; interrupts are masked by the caller. |
 | `rtos_getTimeUs` | Microseconds since start (public API, but port implemented). |

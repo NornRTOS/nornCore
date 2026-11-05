@@ -98,4 +98,70 @@ static inline uint32_t board_appTimerElapsed(void)
     return TCNT2;
 }
 
+/*
+ * Cycle counter and high resolution probe timer, used by the kernel benchmark (tc10).
+ * Only on the Mega: timer 1 counts CPU cycles (prescaler 1, free running, 16 bits, so a
+ * difference is valid for 4 ms) and timer 4 fires BOARD_HIRES_TIMER_VECT at a chosen
+ * rate, its counter telling how many cycles ago the compare match happened. On the UNO
+ * timer 1 is the tick and there is no timer 4.
+ */
+#if defined(BOARD_IS_MEGA)  &&  BOARD_IS_MEGA
+# define BOARD_HAS_CYCLE_COUNTER    1
+# define BOARD_CYCLES_HZ            F_CPU
+# define BOARD_CYCLES_MASK          0xFFFFul
+
+static inline void board_cycleCounterStart(void)
+{
+    TCCR1A = 0;
+    TCCR1B = _BV(CS10);
+    TIMSK1 = 0;
+    TCNT1  = 0;
+}
+
+/** Cycle count since board_cycleCounterStart, modulo BOARD_CYCLES_MASK + 1. Safe in
+    tasks and interrupts (the 16 bit read is done with interrupts disabled). */
+static inline uint32_t board_cycles(void)
+{
+    uint16_t c;
+    const uint8_t s = SREG;
+    cli();
+    c = TCNT1;
+    SREG = s;
+    return c;
+}
+
+# define BOARD_HIRES_TIMER_VECT             TIMER4_COMPA_vect
+# define BOARD_HIRES_TIMER_COUNT_HZ         F_CPU
+# define BOARD_HIRES_TIMER_HZ_IS_EXACT(hz)  (F_CPU % (hz) == 0  &&  F_CPU / (hz) - 1ul <= 65535ul)
+
+/** Timer 4 in CTC mode at prescaler 1: BOARD_HIRES_TIMER_VECT fires hz times per second;
+    the application provides RTOS_ISR(BOARD_HIRES_TIMER_VECT). */
+static inline void board_hiresTimerStart(uint32_t hz)
+{
+    TCCR4A = 0;
+    TCCR4B = 0;
+    TCNT4  = 0;
+    OCR4A  = (uint16_t)(F_CPU / hz - 1ul);
+    TIFR4  = _BV(OCF4A);
+    TIMSK4 = _BV(OCIE4A);
+    TCCR4B = _BV(WGM42) | _BV(CS40);
+}
+
+/** Cycles since the last compare match of the probe timer; call it first in the ISR. */
+static inline uint32_t board_hiresTimerElapsed(void)
+{
+    return TCNT4;
+}
+
+/** Change the probe period to \a counts (cycles) from the next match on. Meant to be
+    called in the probe ISR to dither the period, so that the probes sweep every phase of
+    the tick and of the other periodic activity instead of hitting the same few. */
+static inline void board_hiresTimerSetPeriod(uint32_t counts)
+{
+    OCR4A = (uint16_t)(counts - 1ul);
+}
+#else
+# define BOARD_HAS_CYCLE_COUNTER    0
+#endif
+
 #endif  /* BOARD_INCLUDED */

@@ -4,6 +4,7 @@
 #   make APP=tc01 BOARD=uno  override the board from the command line
 #   make APP=tc01 sim        run in a simulator (simavr for AVR); UART0 goes to the terminal
 #   make APP=tc01 upload     flash the board (PORT=/dev/ttyACM0 or /dev/ttyUSB0)
+#   make APP=x APPDIR=/path  build an application kept outside this repository
 #   make host-test           build and run the kernel unit tests on the PC
 #   make clean
 #
@@ -12,7 +13,7 @@
 # compiled for the MCU, and hal/<arch>/board.h derives the pin map from the MCU macros.
 
 APP     ?= tc01
-APPDIR   = applications/$(APP)
+APPDIR  ?= applications/$(APP)
 -include $(APPDIR)/app.mk
 BOARD   ?= mega2560
 
@@ -22,6 +23,37 @@ ARCH_esp32    = xtensa
 ARCH = $(ARCH_$(BOARD))
 ifeq ($(ARCH),)
   $(error Unknown BOARD '$(BOARD)'; known: $(patsubst ARCH_%,%,$(filter ARCH_%,$(.VARIABLES))))
+endif
+
+# ---- configuration profiles and the kernel library (the binary SDK) --------------------
+# A profile is a frozen rtos_config.h (with nn_config.h and nw_config.h for the modules)
+# under nornRTOS/profiles/<name>/, one section per board; NORN_RTOS is the nornRTOS tree
+# this checkout is a module of (modules/nornCore -> ../..). `make lib BOARD=esp32
+# PROFILE=default` builds the kernel, port and HAL from the profile into
+# build/lib-default-esp32/libnornCore.a, the unit the SDK ships. An application without
+# an rtos_config.h of its own compiles against the profile's (source build), and with
+# USE_LIB = 1 in its app.mk links the library instead of the kernel sources, exactly as
+# an SDK user does. rtos_init checks that both sides were compiled from the same
+# configuration.
+NORN_RTOS   ?= $(abspath ../..)
+PROFILE     ?= default
+PROFILE_DIR ?= $(NORN_RTOS)/profiles/$(PROFILE)
+USE_LIB     ?= 0
+APP_HAS_CONFIG = $(wildcard $(APPDIR)/rtos_config.h)
+ifneq ($(filter lib,$(MAKECMDGOALS)),)
+  APP    := lib-$(PROFILE)
+  APPDIR := $(PROFILE_DIR)
+endif
+# A module library: `make modlib MODULES=<fragment(s)> MODNAME=nornNET MODDIR=<module
+# checkout> MOD_PROFILE_DIR=<dir with the module's profile config> BOARD=.. PROFILE=..`
+# compiles the module against the kernel profile and archives its objects (only those
+# under MODDIR, so a module that needs another module's headers lists both fragments)
+# into build/lib-<profile>-<board>/lib<MODNAME>.a. The module makefiles wrap this.
+MODLIB_INC =
+ifneq ($(filter modlib,$(MAKECMDGOALS)),)
+  APP        := lib-$(PROFILE)
+  APPDIR     := $(MOD_PROFILE_DIR)
+  MODLIB_INC := -I$(PROFILE_DIR)
 endif
 
 # EXTRA_CFLAGS adds compiler flags from the command line, e.g. -DRTOS_CFG_X=1 to try a
@@ -35,21 +67,79 @@ PORT_ASM   = $(wildcard port/$(ARCH)/*.S)
 HAL_SRC    = $(wildcard hal/*.c) $(wildcard hal/$(ARCH)/*.c)
 APP_SRC    = $(wildcard $(APPDIR)/*.c)
 
-OBJ  = $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_SRC) $(PORT_SRC) $(HAL_SRC))
-OBJ += $(patsubst %.S,$(BUILD)/%.o,$(PORT_ASM))
-OBJ += $(patsubst $(APPDIR)/%.c,$(BUILD)/app/%.o,$(APP_SRC))
+KERNEL_OBJ  = $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_SRC) $(PORT_SRC) $(HAL_SRC))
+KERNEL_OBJ += $(patsubst %.S,$(BUILD)/%.o,$(PORT_ASM))
+APP_OBJ     = $(patsubst $(APPDIR)/%.c,$(BUILD)/app/%.o,$(APP_SRC))
 
-INC = -Ikernel -Iport/$(ARCH) -Ihal -Ihal/$(ARCH) -I$(APPDIR)
+ifeq ($(USE_LIB),1)
+  KERNEL_LIB      = build/lib-$(PROFILE)-$(BOARD)/libnornCore.a
+  # whole-archive: the vector tables, the AVR .init3 hook and the weak defaults are not
+  # referenced by name, --gc-sections still drops what the image does not use
+  KERNEL_LIB_LINK = -Wl,--whole-archive $(KERNEL_LIB) -Wl,--no-whole-archive
+  OBJ = $(APP_OBJ)
+  INC = -I$(PROFILE_DIR) -Ikernel -Iport/$(ARCH) -Ihal -Ihal/$(ARCH) -I$(APPDIR)
+else
+  KERNEL_LIB      =
+  KERNEL_LIB_LINK =
+  OBJ = $(KERNEL_OBJ) $(APP_OBJ)
+  INC = $(MODLIB_INC) $(if $(APP_HAS_CONFIG),,-I$(PROFILE_DIR)) -Ikernel -Iport/$(ARCH) -Ihal -Ihal/$(ARCH) -I$(APPDIR)
+endif
+LIB = $(BUILD)/libnornCore.a
+MODLIB     = $(BUILD)/lib$(MODNAME).a
+MODLIB_OBJ = $(filter $(BUILD)/mod$(abspath $(MODDIR))/%,$(MOD_OBJ))
 
-.PHONY: all image sim upload monitor host-test test-all clean
+# ---- external modules --------------------------------------------------------------------
+# An application may pull in code from outside this repository (nornNET, for example):
+# its app.mk lists makefile fragments in MODULES. A fragment appends C sources to MOD_SRC,
+# include flags to MOD_INC and defines to MOD_CFLAGS. Module objects are built under
+# $(BUILD)/mod/<absolute path>.
+MODULES ?=
+ifneq ($(MODULES),)
+  include $(MODULES)
+endif
+MOD_OBJ = $(patsubst /%.c,$(BUILD)/mod/%.o,$(abspath $(MOD_SRC)))
+OBJ    += $(MOD_OBJ)
+INC    += $(MOD_INC)
+# ESP32 only (port/xtensa/arch.mk): a module may put objects and archives in flash
+# (MOD_FLASH_OBJS, file name patterns), name input sections for IRAM, flash and DRAM
+# (MOD_IRAM_SECTIONS, MOD_FLASH_SECTIONS, MOD_FLASH_RODATA_SECTIONS, MOD_DRAM_SECTIONS),
+# add linker script fragments (MOD_LD), linker flags (MOD_LDFLAGS) and libraries linked
+# after the objects and before libc (MOD_LDLIBS). A library the module builds itself with
+# its own rule (under $(BUILD)/mod) is listed in MOD_LIBS so that the link waits for it.
+FLASH_OBJS             += $(MOD_FLASH_OBJS)
+IRAM_SECTIONS          += $(MOD_IRAM_SECTIONS)
+FLASH_SECTIONS         += $(MOD_FLASH_SECTIONS)
+FLASH_RODATA_SECTIONS  += $(MOD_FLASH_RODATA_SECTIONS)
+DRAM_SECTIONS          += $(MOD_DRAM_SECTIONS)
+
+.PHONY: all image sim upload monitor lib modlib host-test host-cov analyze test-all clean
 
 all: image
 
 include port/$(ARCH)/arch.mk
-CFLAGS  += $(EXTRA_CFLAGS)
+CFLAGS  += $(EXTRA_CFLAGS) $(MOD_CFLAGS)
 
-$(TARGET).elf: $(OBJ)
-	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
+$(TARGET).elf: $(OBJ) $(MOD_LIBS) $(KERNEL_LIB)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(KERNEL_LIB_LINK) $(MOD_LDLIBS) $(LDLIBS)
+
+lib: $(LIB)
+	@echo "$(LIB): $$(ls -l $(LIB) | awk '{print $$5}') bytes, profile $(PROFILE_DIR)"
+
+$(LIB): $(KERNEL_OBJ)
+	rm -f $@
+	$(AR) rcs $@ $(KERNEL_OBJ)
+
+ifeq ($(USE_LIB),1)
+$(KERNEL_LIB):
+	$(MAKE) --no-print-directory lib BOARD=$(BOARD) PROFILE=$(PROFILE)
+endif
+
+modlib: $(MODLIB) $(MOD_LIBS)
+	@echo "$(MODLIB): $$(ls -l $(MODLIB) | awk '{print $$5}') bytes, $(words $(MODLIB_OBJ)) objects, profile $(MOD_PROFILE_DIR)"
+
+$(MODLIB): $(MODLIB_OBJ)
+	rm -f $@
+	$(AR) rcs $@ $(MODLIB_OBJ)
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -60,6 +150,10 @@ $(BUILD)/%.o: %.S
 	$(CC) $(ASFLAGS) -c -o $@ $<
 
 $(BUILD)/app/%.o: $(APPDIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD)/mod/%.o: /%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -86,6 +180,18 @@ host-test: $(HOST_TESTS)
 # ESP32 if one is connected. See tools/test_all.sh for the variables it takes.
 test-all:
 	tools/test_all.sh
+
+# Line coverage of the kernel by the host tests (gcov, no sanitizers): builds every test
+# program instrumented under build/host-cov, runs it and prints one line per kernel file
+# plus the uncovered line ranges (tools/host_cov.sh).
+host-cov:
+	tools/host_cov.sh
+
+# Static analysis with gcc's -fanalyzer over the kernel and the host port, file by file,
+# in the unit test configuration; prints only the diagnostics. The AVR and Xtensa ports
+# are analyzed the same way with their compilers in tools/analyze.sh.
+analyze:
+	tools/analyze.sh
 
 clean:
 	rm -rf build

@@ -32,6 +32,11 @@
 #define RTOS_TF_EVG_CLEAR       RTOS_TF_NOTIFY_TAKE   /* reused: the two never coexist */
 
 
+/** Force inlining of a function on the hot path (context switch, interrupt tail), where
+    a call, its register saves and the lost register allocation cost more than the code. */
+#define RTOS_KERNEL_HOT_INLINE  static inline __attribute__((always_inline))
+
+
 /*
  * Global type definitions
  */
@@ -50,12 +55,16 @@ typedef struct rtos_tcb
     rtos_tick_t periodBase;         /**< Last period boundary of rtos_waitPeriodic. */
     rtos_evt_t evtPending;          /**< Events posted but not yet consumed. */
     rtos_evt_t evtWait;             /**< Events awaited, 0 if not waiting for events. */
+#if RTOS_CFG_NOTIFY
     uint16_t notifyValue;           /**< Task notification value. */
+#endif
 #if RTOS_CFG_RUNTIME_STATS
     rtos_runtime_t runTime;         /**< Accumulated run time, RTOS_RUNTIME_HZ. */
 #endif
+#if RTOS_CFG_STACK_CHECK
     uint8_t *pStackArea;            /**< Stack memory, for the high water mark. */
     size_t stackSize;               /**< Size of the stack memory. */
+#endif
     const void *pWaitObj;           /**< Object waited on; see waitKind. */
     rtos_taskmask_t bit;            /**< 1 << prio, precomputed. */
     uint8_t prio;                   /**< Base priority = task id = array index. */
@@ -75,6 +84,7 @@ extern rtos_tcb_t *rtos_pCurrent;
 extern rtos_tcb_t *rtos_pNext;
 extern volatile uint8_t rtos_needSwitch;
 extern volatile rtos_tick_t rtos_tickCount;
+extern rtos_taskmask_t rtos_kernel_readyMask;
 
 
 /*
@@ -85,8 +95,49 @@ void rtos_kernel_makeReady(rtos_tcb_t *pT);
 void rtos_kernel_schedule(void);
 bool rtos_kernel_blockCurrent(rtos_tick_t timeout);
 
-/** Block the current task on an object: records what it waits on, then blockCurrent. */
-bool rtos_kernel_blockOn(uint8_t waitKind, const void *pWaitObj, rtos_tick_t timeout);
+/** Block the current task on an object: records what it waits on, then blockCurrent.
+    Inline: it sits on the path of every blocking call. */
+static inline bool rtos_kernel_blockOn(uint8_t waitKind, const void *pWaitObj, rtos_tick_t timeout)
+{
+    rtos_pCurrent->waitKind = waitKind;
+    rtos_pCurrent->pWaitObj = pWaitObj;
+    return rtos_kernel_blockCurrent(timeout);
+}
+
+extern const uint8_t rtos_kernel_hiBitNibble[16];
+
+/** Index of the highest set bit of a byte. Must not be called with 0. */
+static inline uint8_t rtos_kernel_highestBit8(uint8_t b)
+{
+    return (b & 0xF0u) ? (uint8_t)(4u + rtos_kernel_hiBitNibble[b >> 4]) : rtos_kernel_hiBitNibble[b];
+}
+
+/**
+ * Index of the highest set bit of a task mask, i.e. the highest priority task in it. Must
+ * not be called with 0 (the ready mask always holds the idle bit). A port with a count
+ * leading zeros instruction defines RTOS_PORT_HIGHEST_BIT(m) and the nibble table is not
+ * used.
+ */
+static inline uint8_t rtos_kernel_highestBit(rtos_taskmask_t m)
+{
+#if defined(RTOS_PORT_HIGHEST_BIT)
+    return (uint8_t)RTOS_PORT_HIGHEST_BIT(m);
+#elif RTOS_CFG_NUM_TASKS + 1 > 16
+    if(m & 0xFF000000ul)
+        return (uint8_t)(24u + rtos_kernel_highestBit8((uint8_t)(m >> 24)));
+    if(m & 0x00FF0000ul)
+        return (uint8_t)(16u + rtos_kernel_highestBit8((uint8_t)(m >> 16)));
+    if(m & 0x0000FF00ul)
+        return (uint8_t)(8u + rtos_kernel_highestBit8((uint8_t)(m >> 8)));
+    return rtos_kernel_highestBit8((uint8_t)m);
+#elif RTOS_CFG_NUM_TASKS + 1 > 8
+    if(m & 0xFF00u)
+        return (uint8_t)(8u + rtos_kernel_highestBit8((uint8_t)(m >> 8)));
+    return rtos_kernel_highestBit8((uint8_t)m);
+#else
+    return rtos_kernel_highestBit8((uint8_t)m);
+#endif
+}
 
 /** Byte every task stack is filled with at creation; also the stack bottom canary. */
 #define RTOS_STACK_FILL     0xA5u
@@ -122,11 +173,41 @@ void rtos_kernel_wdtIdle(void);
 
 /** Timer task created by rtos_start when RTOS_CFG_TIMER_TASK_PRIO is set. */
 void rtos_kernel_timerTaskCreate(void);
-uint8_t rtos_kernel_releaseHighestWaiter(rtos_taskmask_t *pWaiters);
+/** Pick the highest priority waiter in a mask (must not be 0), remove it and make it
+    ready; returns its TCB. */
+rtos_tcb_t *rtos_kernel_releaseHighestWaiter(rtos_taskmask_t *pWaiters);
 void rtos_kernel_timerTick(rtos_tick_t now);
 
 /* Read-only views for tests and debuggers; no locking, call with interrupts disabled. */
 rtos_taskmask_t rtos_kernel_getReadyMask(void);
 rtos_tcb_t *rtos_kernel_getTimedHead(void);
+
+/* Task start in steps, for a port that starts tasks from a frameless stub: the first
+   step sets the period base and enables interrupts and returns the function to call,
+   the second the argument; the third never returns (called when the function does). */
+rtos_taskFunc_t rtos_kernel_taskStarting(void);
+void *rtos_kernel_taskStartArg(void);
+void rtos_kernel_taskExit(void) __attribute__((noreturn));
+
+/** Bookkeeping of the switch at the end of an interrupt (next task, stack check, trace,
+    run time), out of line; the caller then calls rtos_port_switchContext itself. */
+void rtos_kernel_isrPrepareSwitch(uint8_t hi);
+
+/** Body of rtos_isrTail for a port that calls it from its own interrupt epilogue without
+    another call level: the switch is called from the caller's frame, so a task switched
+    out of an interrupt leaves one frame less on its stack. */
+RTOS_KERNEL_HOT_INLINE void rtos_kernel_isrTailInline(void)
+{
+    if(rtos_needSwitch)
+    {
+        const uint8_t hi = rtos_kernel_highestBit(rtos_kernel_readyMask);
+        rtos_needSwitch = 0;
+        if(hi > rtos_pCurrent->effPrio)
+        {
+            rtos_kernel_isrPrepareSwitch(hi);
+            rtos_port_switchContext();
+        }
+    }
+}
 
 #endif  /* RTOS_KERNEL_INCLUDED */

@@ -1,24 +1,27 @@
 /**
  * @file test_stress.c
  * Randomized stress test of the kernel on the host port. Six tasks pick random operations
- * on shared semaphore, mutex, queue, mailbox, pool, events, notifications and software
- * timers with random timeouts; the idle hook advances time and injects random interrupts
- * that use the FromIsr variants. After every operation and every interrupt the kernel's
- * invariants are checked:
+ * on shared semaphore, mutex, queue, mailbox, pool, event group, heap, events,
+ * notifications, periodic waits, suspend/resume and software timers with random
+ * timeouts; the idle hook advances time and injects random interrupts that use the
+ * FromIsr variants. After every operation and every interrupt the kernel's invariants
+ * are checked:
  *
  *   - the idle bit and the running task's bit are set in the ready mask
  *   - a task is in the timed list exactly when its flag says so; the list is sorted
- *   - a task that is not ready is in the timed list, registered as a waiter, or waiting
- *     forever for events or a notification; a ready task is none of these
+ *   - a task that is not ready is in the timed list, registered as a waiter, waiting
+ *     forever for events or a notification, or suspended; a ready task is none of these
  *   - no waiter mask of any object contains a ready task
  *   - the mutex owner, if any, runs at the ceiling; everybody else at their own priority
  *   - queue fill never exceeds the capacity; pool free count matches the free list and
- *     the blocks held by tasks and the ISR
+ *     the blocks held by tasks and the ISR; heap allocations minus frees equal the
+ *     blocks the tasks hold
  *   - the run times of all tasks add up to the elapsed time
  *
  * Data integrity: queue items carry producer and sequence number and must arrive in
- * order per producer; pool blocks carry an owner stamp that must be intact when freed.
- * Liveness: every task must have completed operations when the run ends.
+ * order per producer; pool and heap blocks carry an owner stamp that must be intact
+ * when freed. Liveness: every task must have completed operations when the run ends, and
+ * every suspended task is resumed by a timer within a few ticks.
  *
  * The random sequence is fixed (SEED), so a failure is reproducible; set SEED or TICKS
  * on the command line for other runs.
@@ -57,6 +60,16 @@ static rtos_mbox_t  _mbox  = RTOS_MBOX_INIT(_mbStorage, sizeof(item_t));
 static uint8_t      _poolStorage[POOL_BLOCKS * BLOCK_SIZE];
 static rtos_pool_t  _pool  = RTOS_POOL_INIT(_poolStorage, BLOCK_SIZE, POOL_BLOCKS);
 static rtos_timer_t _timers[NUM_TASKS + 1];
+static rtos_timer_t _resumeTimers[NUM_TASKS + 1];
+static rtos_evgroup_t _group = RTOS_EVGROUP_INIT(0);
+static uint8_t  _heapArea[768];
+#define HEAP_HELD_MAX   2
+#define HEAP_SIZE_MAX   40
+static void    *_heapHeld[NUM_TASKS + 1][HEAP_HELD_MAX];
+static uint8_t  _heapSize[NUM_TASKS + 1][HEAP_HELD_MAX];
+static volatile uint8_t _suspended[NUM_TASKS + 1];
+static uint32_t _suspends, _resumes;
+#define NUM_OPS         24
 
 static uint32_t _rng = SEED;
 static uint32_t _ops[NUM_TASKS + 1];
@@ -68,7 +81,7 @@ static uint16_t _seqSeen[NUM_TASKS + 1][16]; /* per consumer and producer, last 
 static void    *_held[NUM_TASKS + 1][HELD_MAX];
 static void    *_heldIsr;
 static uint8_t  _mutexHolder = RTOS_NO_TASK;
-static uint32_t _opCount[16];
+static uint32_t _opCount[NUM_OPS];
 
 
 static uint32_t rnd(void)
@@ -139,12 +152,15 @@ static void checkInvariants(void)
         const bool timed = inTimedList(pT);
         const bool waiter = pT->pWaiters != NULL;
         const bool forever = (pT->flags & RTOS_TF_WAIT_NOTIFY) != 0  ||  pT->evtWait != 0;
+        const bool suspended = (pT->flags & RTOS_TF_SUSPENDED) != 0;
 
         CHECK(timed == ((pT->flags & RTOS_TF_IN_TIMED_LIST) != 0), i, pT->flags);
         if(isReady)
-            CHECK(!timed && !waiter, i, pT->flags);
+            CHECK(!timed && !waiter && !suspended, i, pT->flags);
         else
-            CHECK(timed || waiter || forever, i, pT->flags);
+            CHECK(timed || waiter || forever || suspended, i, pT->flags);
+        if(suspended)
+            CHECK(pT != rtos_pCurrent, i, pT->flags);
         if(waiter)
             CHECK((*pT->pWaiters & pT->bit) != 0, i, *pT->pWaiters);
         if(_mutex.owner == i)
@@ -158,6 +174,7 @@ static void checkInvariants(void)
     CHECK((_queue.writers & ready) == 0, _queue.writers, ready);
     CHECK((_mbox.readers & ready) == 0, _mbox.readers, ready);
     CHECK((_pool.waiters & ready) == 0, _pool.waiters, ready);
+    CHECK((_group.waiters & ready) == 0, _group.waiters, ready);
     /* The test's own holder variable is set after the lock returns; between a hand-over
        and that moment the kernel knows the owner and the test does not yet. */
     CHECK(_mutex.owner == RTOS_NO_TASK || _mutexHolder == RTOS_NO_TASK
@@ -179,6 +196,21 @@ static void checkInvariants(void)
     for(i=0; i<=NUM_TASKS; ++i)
         runSum += rtos_getTaskRunTime(i);
     CHECK(runSum == rtos_tickCount, (uint32_t)runSum, rtos_tickCount);
+
+    {
+        rtos_heapStats_t hs;
+        uint16_t held = 0;
+        uint8_t k;
+        for(i=1; i<=NUM_TASKS; ++i)
+            for(k=0; k<HEAP_HELD_MAX; ++k)
+                if(_heapHeld[i][k] != NULL)
+                    ++ held;
+        rtos_heapStats(&hs);
+        CHECK(hs.allocs - hs.frees == held, hs.allocs - hs.frees, held);
+        CHECK(hs.free <= hs.total  &&  hs.minFree <= hs.free, (uint32_t)hs.free, (uint32_t)hs.total);
+        if(held == 0)
+            CHECK(hs.free == hs.total, (uint32_t)hs.free, (uint32_t)hs.total);
+    }
 
     rtos_port_exitCritical(cs);
 }
@@ -240,12 +272,53 @@ static void timerCallback(void *arg)
     rtos_postEventsFromIsr(task, 0x8);
 }
 
+static void resumeCallback(void *arg)
+{
+    const uint8_t task = (uint8_t)(uintptr_t)arg;
+    _suspended[task] = 0;
+    ++ _resumes;
+    rtos_resumeFromIsr(task);
+}
+
+/** Suspend \a task (which may be the caller) and let a timer resume it in 1..3 ticks.
+    Interrupts off between the two so that the resume cannot overtake the suspend. */
+static void suspendFor(uint8_t task)
+{
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+    if(!_suspended[task]  &&  !rtos_timerIsActive(&_resumeTimers[task]))
+    {
+        _suspended[task] = 1;
+        ++ _suspends;
+        rtos_timerStart(&_resumeTimers[task], (rtos_tick_t)(1u + rnd() % 3u), 0);
+        rtos_suspend(task);
+    }
+    rtos_port_exitCritical(cs);
+}
+
+static void stampHeap(void *p, uint8_t size, uint8_t owner)
+{
+    uint8_t *b = p;
+    uint8_t i;
+    for(i=0; i<size; ++i)
+        b[i] = (uint8_t)(owner * 53u + i);
+}
+
+static bool verifyHeap(const void *p, uint8_t size, uint8_t owner)
+{
+    const uint8_t *b = p;
+    uint8_t i;
+    for(i=0; i<size; ++i)
+        if(b[i] != (uint8_t)(owner * 53u + i))
+            return false;
+    return true;
+}
+
 
 /* ---- the tasks ----------------------------------------------------------------------- */
 
 static void randomOp(uint8_t me)
 {
-    const uint32_t op = rnd() % 16u;
+    const uint32_t op = rnd() % NUM_OPS;
     ++ _opCount[op];
     switch(op)
     {
@@ -357,12 +430,69 @@ static void randomOp(uint8_t me)
         }
         break;
     }
-    default:
+    case 15:
         if(rtos_timerIsActive(&_timers[me]))
             rtos_timerStop(&_timers[me]);
         else
             rtos_timerStart(&_timers[me], (rtos_tick_t)(1u + rnd() % 5u),
                             (rnd() & 1u) ? (rtos_tick_t)(2u + rnd() % 3u) : 0u);
+        break;
+    case 16:
+    {
+        const rtos_evt_t mask = (rtos_evt_t)(1u + rnd() % 15u);
+        const uint8_t opt = (uint8_t)(((rnd() & 1u) ? RTOS_WAIT_ALL : RTOS_WAIT_ANY)
+                                      | ((rnd() & 1u) ? RTOS_WAIT_CLEAR : 0u));
+        const rtos_evt_t got = rtos_evgroupWait(&_group, mask, opt, randomTimeout());
+        CHECK((got & ~mask) == 0, got, mask);
+        if(got != 0  &&  (opt & RTOS_WAIT_ALL))
+            CHECK(got == mask, got, mask);
+        break;
+    }
+    case 17:
+        rtos_evgroupSet(&_group, (rtos_evt_t)(1u + rnd() % 15u));
+        break;
+    case 18:
+        rtos_evgroupClear(&_group, (rtos_evt_t)(1u + rnd() % 15u));
+        break;
+    case 19:
+    {
+        uint8_t k;
+        for(k=0; k<HEAP_HELD_MAX; ++k)
+            if(_heapHeld[me][k] == NULL)
+                break;
+        if(k < HEAP_HELD_MAX)
+        {
+            const uint8_t size = (uint8_t)(1u + rnd() % HEAP_SIZE_MAX);
+            void * const p = rtos_malloc(size);
+            if(p != NULL)
+            {
+                stampHeap(p, size, me);
+                _heapHeld[me][k] = p;
+                _heapSize[me][k] = size;
+            }
+        }
+        else
+        {
+            void *p;
+            k = (uint8_t)(rnd() % HEAP_HELD_MAX);
+            p = _heapHeld[me][k];
+            CHECK(verifyHeap(p, _heapSize[me][k], me), me, k);
+            _heapHeld[me][k] = NULL;
+            rtos_free(p);
+        }
+        break;
+    }
+    case 20:
+        suspendFor(randomTask());         /* another task, or ourselves */
+        break;
+    case 21:
+        (void)rtos_waitPeriodic((rtos_tick_t)(1u + rnd() % 4u));
+        break;
+    case 22:
+        rtos_broadcastEvents((rtos_evt_t)(1u + rnd() % 15u));
+        break;
+    default:
+        (void)rtos_waitEvents(0x8, RTOS_WAIT_ANY, randomTimeout());   /* the timer's event */
         break;
     }
 }
@@ -433,7 +563,31 @@ static void isrMbox(void)
     (void)rtos_mboxPostFromIsr(&_mbox, &it);
 }
 
-static void (* const _isrs_[])(void) = { isrEvents, isrSem, isrQueue, isrNotify, isrPool, isrMbox };
+static void isrEvgroup(void)
+{
+    rtos_evgroupSetFromIsr(&_group, (rtos_evt_t)(1u + rnd() % 15u));
+}
+
+static void isrQueueRecv(void)
+{
+    item_t it;
+    if(rtos_queueReceiveFromIsr(&_queue, &it))
+        receivedItem(0, &it);              /* the ISR consumes as "task 0" */
+}
+
+static void isrResume(void)
+{
+    const uint8_t t = randomTask();        /* early resume, or a no-op */
+    if(_suspended[t])
+    {
+        _suspended[t] = 0;
+        ++ _resumes;
+        rtos_resumeFromIsr(t);
+    }
+}
+
+static void (* const _isrs_[])(void) = { isrEvents, isrSem, isrQueue, isrNotify, isrPool, isrMbox,
+                                         isrEvgroup, isrQueueRecv, isrResume };
 
 static void finish(void)
 {
@@ -449,14 +603,18 @@ static void finish(void)
             live = false;
     }
     printf("\nop histogram:");
-    for(i=0; i<16; ++i)
+    for(i=0; i<NUM_OPS; ++i)
         printf(" %lu", (unsigned long)_opCount[i]);
+    printf("\nsuspends=%lu resumes=%lu", (unsigned long)_suspends, (unsigned long)_resumes);
     printf("\nqueue items sent: task");
     for(i=1; i<=NUM_TASKS; ++i)
         printf(" %u", _seqNext[i]);
     printf(" isr %u\n", _seqNext[PRODUCER_ISR]);
     if(!live)
         fail("a task never ran", 0, 0);
+    for(i=1; i<=NUM_TASKS; ++i)
+        if(_suspended[i]  &&  !rtos_timerIsActive(&_resumeTimers[i]))
+            fail("suspended with no resume pending", i, 0);
     printf("%s: test_stress (%lu failures)\n", _failures == 0 ? "PASS" : "FAIL",
            (unsigned long)_failures);
     exit(_failures == 0 ? 0 : 1);
@@ -483,9 +641,11 @@ int main(void)
 
     rtos_init();
     rtos_poolInit(&_pool, _poolStorage, BLOCK_SIZE, POOL_BLOCKS);
+    rtos_heapInit(_heapArea, sizeof(_heapArea));
     for(i=1; i<=NUM_TASKS; ++i)
     {
         rtos_timerInit(&_timers[i], timerCallback, (void *)(uintptr_t)i);
+        rtos_timerInit(&_resumeTimers[i], resumeCallback, (void *)(uintptr_t)i);
         rtos_createTask(i, task, (void *)(uintptr_t)i, _stacks[i], sizeof(_stacks[i]));
     }
     rtos_start();

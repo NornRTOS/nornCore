@@ -54,6 +54,24 @@ implements it; the AVR ports sleep one tick at a time.
 Run time statistics are taken at every context switch from a free running counter, so the
 per task run times always add up to the elapsed time and `rtos_getCpuLoad` is exact.
 
+## The hot path
+
+Every blocking call and every interrupt that wakes a task goes through the same few
+functions: make a task ready, pick the highest ready task, account the run time, switch.
+Interrupts are masked from the call that decides to switch until the task switched to
+leaves its own kernel call, so this path is both the context switch cost and the worst
+interrupt latency; tc10 measures it in cycles. Rules that came out of measuring it on the
+Mega (496 to 423 cycles per switch, 2026-11-04): the port's run time counter must be an
+addition, not a multiplication (the AVR keeps a per tick base); the highest waiter comes
+from the bit mask lookup, not a scan; `rtos_assertFailed` is `noreturn` so that the
+compiler does not save registers for the failure branch; the run time accounting is
+inlined into the two switch sites; the timed list removal is kept out of line because only
+timed out or cancelled waits need it. Inlining the scheduler into the blocking path was
+tried and rejected on the AVR: the register pressure cost more than the call. Each of
+these is a few cycles; what remains is the register save itself (about 105 cycles on the
+AVR, more on the ESP32 where the windows are spilled) and the configurable bookkeeping
+(run time statistics about 45, assertions about 20).
+
 ## Memory
 
 Everything is static: tasks, stacks and objects are declared by the application and

@@ -11,6 +11,9 @@
 #define RTOS_CFG_ASSERT         1
 #define RTOS_CFG_SW_TIMERS      1
 #define RTOS_CFG_RUNTIME_STATS  1
+#define RTOS_CFG_EVGROUPS       1
+#define RTOS_CFG_SUSPEND        1
+#define RTOS_CFG_HEAP           1
 #define RTOS_CFG_IDLE_HOOK      test_idleHook
 
 void test_idleHook(void);

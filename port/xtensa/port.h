@@ -34,9 +34,26 @@
  * Defines
  */
 
-/** Smallest stack: an interrupt frame, the window spill area of a few nested calls and
-    some room for the task itself. */
-#define RTOS_PORT_MIN_STACK     1024u
+/** Smallest stack we accept. Measured with tc11 (2026-11-04, QEMU): a task that only
+    blocks leaves 300 bytes on its stack (seven 32 byte call8 frames down to
+    rtos_port_switchContext plus the spill slots below the deepest frame), a running task
+    that is interrupted 336 (the 176 byte interrupt frame, the dispatch, the handler and
+    the switch out of it); the FPU trap needs less than the interrupt. tc12 shows the
+    share does not grow with the depth of the task's own call chain (the live windows are
+    spilled into frames the task already owns). 512 leaves a task with three or four
+    call8 frames of its own (48 bytes each with a few locals); anything that prints or
+    nests deeper wants more: own frames plus about 350. */
+#define RTOS_PORT_MIN_STACK     512u
+
+/** Recommended starting sizes (see README "Stacks"): the default for an ordinary task,
+    and for a task that prints, nests calls or uses floating point. Neither is an upper
+    bound; deep call chains and crypto or network tasks need more. */
+#define RTOS_PORT_DEFAULT_STACK 1024u
+#define RTOS_PORT_LARGE_STACK   2048u
+
+/** Stack monitor: warn when fewer than this many bytes of a stack were never touched;
+    two call8 frames, i.e. the next nested call or interrupt may overflow. */
+#define RTOS_PORT_STACK_WARN    96u
 
 /** The windowed ABI needs 16 byte aligned stack frames. */
 #define RTOS_PORT_STACK_ALIGN   16u
@@ -50,11 +67,21 @@
 /** Strings live in DRAM; nothing to do. */
 #define RTOS_PORT_STR(s)        (s)
 
+/** Put a function, or a constant, in flash instead of IRAM/DRAM (see esp32.ld). Slower
+    through the cache, never for interrupt handlers or what they call. */
+#define RTOS_PORT_FLASH_TEXT    __attribute__((section(".flash.text.user")))
+#define RTOS_PORT_FLASH_RODATA  __attribute__((section(".flash.rodata.user")))
+
 /** Run time counter: the CPU cycle counter CCOUNT, extended to 64 bits by the port. */
 #define RTOS_PORT_RUNTIME_HZ    F_CPU
+#define RTOS_PORT_CYCLES_PER_TICK   (F_CPU / RTOS_CFG_TICK_HZ)
 
 /** nsau gives the leading zero count in one instruction. */
 #define RTOS_PORT_HIGHEST_BIT(m)    (31 - __builtin_clz((uint32_t)(m)))
+
+/** The scheduler is inlined into the blocking path: one 32 byte frame less per task
+    (see rtos_kernel.c). */
+#define RTOS_PORT_INLINE_SCHEDULE   1
 
 /** Interrupt body definition; the port's dispatcher calls it. */
 #define RTOS_ISR(vector)        RTOS_ISR_(vector)
@@ -149,10 +176,28 @@ static inline uint32_t rtos_port_ccount(void)
 void rtos_port_switchContext(void);
 rtos_port_ctx_t rtos_port_initStack(uint8_t *stackArea, size_t stackSize, void (*entry)(void));
 void rtos_port_startTimer(void);
-rtos_port_runtime_t rtos_port_getRunTimeCounter(void);
+/** Tick bookkeeping of port_esp32.c: the CCOUNT value of the next tick and the cycles of
+    all completed ticks (kept in step by the tick interrupt). */
+extern uint32_t rtos_port_nextTick;
+extern rtos_port_runtime_t rtos_port_runBase;
 
-/** Called from _start before main: watchdogs off, clocks known. */
+/** Cycles of all completed ticks plus the cycles since the last tick boundary. Inline
+    and an addition only: it is read at every context switch. Interrupts masked. */
+static inline rtos_port_runtime_t rtos_port_getRunTimeCounter(void)
+{
+    const uint32_t sinceTick = rtos_port_ccount() - (rtos_port_nextTick - RTOS_PORT_CYCLES_PER_TICK);
+    return rtos_port_runBase + sinceTick;
+}
+
+/** Called from _start before main: watchdogs off, clocks known, flash code mapped. */
 void rtos_port_earlyInit(void);
+
+/** Map the .flash.* sections (esp32.ld) through the flash MMU and enable the cache; a
+    no-op when nothing is in flash. Called by rtos_port_earlyInit on the PRO CPU. */
+void rtos_port_flashInit(void);
+
+/** Number of 64 KB flash pages mapped by rtos_port_flashInit. */
+uint32_t rtos_port_flashPages(void);
 
 /** Switch the CPU to F_CPU (port_clock.c); called by rtos_port_earlyInit. */
 void rtos_port_clockInit(void);
@@ -172,9 +217,6 @@ void rtos_port_wdtKick(void);
 /** Route peripheral interrupt \a source (ESP32 TRM table, or RTOS_PORT_SRC_NONE for an
     internal CPU interrupt) to level 1 CPU interrupt \a cpuInt and enable it. */
 void rtos_port_attachInterrupt(uint8_t cpuInt, uint8_t source, rtos_port_isr_t handler);
-
-/** Called from the interrupt entry with interrupts masked: runs every pending handler. */
-void rtos_port_dispatchLevel1(void);
 
 /** Called from the exception entry: level 1 interrupts and the FPU trap. */
 void rtos_port_exception(uint32_t cause, uint32_t *pFrame);

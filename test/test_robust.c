@@ -147,6 +147,9 @@ static void s3_task1(void *arg)
 }
 
 /* 4: timer callback runs in the timer task and may block. */
+static volatile unsigned _s4Fired;
+static void s4_count(void *arg) { (void)arg; ++ _s4Fired; }
+static void s4_stopC(void *arg) { rtos_timerStop((rtos_timer_t *)arg); }
 static void s4_callback(void *arg)
 {
     (void)arg;
@@ -172,6 +175,21 @@ static void s4_task1(void *arg)
     rtos_timerStop(&_timer);
     EXPECT(_timerCbDone, 0, 0);
     EXPECT(!rtos_timerIsActive(&_timer) && !_timer.pending, _timer.pending, 0);
+    /* Three timers expire in the same tick and queue up for the timer task; the first
+       callback stops the third while it is still pending behind the second. */
+    {
+        static rtos_timer_t a, b, c;
+        _s4Fired = 0;
+        rtos_timerInit(&a, s4_stopC, &c);
+        rtos_timerInit(&b, s4_count, NULL);
+        rtos_timerInit(&c, s4_count, NULL);
+        rtos_timerStart(&a, 2, 0);
+        rtos_timerStart(&b, 2, 0);
+        rtos_timerStart(&c, 2, 0);
+        rtos_delay(5);
+        EXPECT(_s4Fired == 1, _s4Fired, 1);                 /* b fired, c was stopped */
+        EXPECT(!c.pending && !rtos_timerIsActive(&c), c.pending, 0);
+    }
     pass("timer callbacks run in the timer task");
 }
 
@@ -238,6 +256,31 @@ static void s6_task1(void *arg)
     pass("trace hook");
 }
 
+/* 8: the stack monitor warns once when a task's untouched margin is gone. The host
+   stack areas are dummies that the port never touches, so the task dirties its own
+   area from the bottom, leaving less than RTOS_PORT_STACK_WARN (8) bytes but more than
+   the 4 byte canary. */
+static volatile uint8_t _warnTask, _warnCount;
+static volatile size_t _warnFree;
+void rtos_stackWarnHook(uint8_t task, size_t stackFree)
+{
+    _warnTask = task;
+    _warnFree = stackFree;
+    ++ _warnCount;
+}
+static void s8_task1(void *arg)
+{
+    (void)arg;
+    rtos_delay(5);                      /* the monitor sees a full margin: no warning */
+    EXPECT(_warnCount == 0, _warnCount, 0);
+    memset(_stack1 + 6, 0, sizeof(_stack1) - 6);       /* 6 untouched bytes at the bottom */
+    rtos_delay(5);
+    EXPECT(_warnCount == 1 && _warnTask == T1 && _warnFree == 6, _warnCount, (uint32_t)_warnFree);
+    rtos_delay(5);
+    EXPECT(_warnCount == 1, _warnCount, 1);             /* once per task */
+    pass("stack monitor warned once for T1");
+}
+
 /* 7: an assertion failure goes through rtos_panic. */
 static void s7_task1(void *arg)
 {
@@ -266,6 +309,7 @@ static int runScenario(int n)
         break;
     case 6: rtos_createTask(T1, s6_task1, NULL, _stack1, sizeof(_stack1)); break;
     case 7: rtos_createTask(T1, s7_task1, NULL, _stack1, sizeof(_stack1)); break;
+    case 8: rtos_createTask(T1, s8_task1, NULL, _stack1, sizeof(_stack1)); break;
     default:
         return 2;
     }
@@ -273,7 +317,7 @@ static int runScenario(int n)
     return 1;
 }
 
-#define NUM_SCENARIOS 7
+#define NUM_SCENARIOS 8
 
 int main(int argc, char **argv)
 {

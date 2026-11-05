@@ -13,6 +13,9 @@
 #include "rtos_types.h"
 
 #define RTOS_PORT_MIN_STACK     1u
+#define RTOS_PORT_DEFAULT_STACK 1u
+#define RTOS_PORT_LARGE_STACK   1u
+#define RTOS_PORT_STACK_WARN    8u      /* the host stacks are dummies; tests dirty them */
 /* The host port runs tasks on its own malloc'd stacks and ignores the area given to
    rtos_createTask, so the tests may pass 1 byte arrays. */
 #define RTOS_PORT_STACK_ALIGN   1u

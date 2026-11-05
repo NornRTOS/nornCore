@@ -21,28 +21,16 @@
 /**
  * Pick the highest priority waiter in a mask, remove it and make it ready. Interrupts
  * disabled. The mask must not be 0.
- *   @return The task id of the released waiter.
+ *   @return The TCB of the released waiter.
  */
-uint8_t rtos_kernel_releaseHighestWaiter(rtos_taskmask_t *pWaiters)
+rtos_tcb_t *rtos_kernel_releaseHighestWaiter(rtos_taskmask_t *pWaiters)
 {
-    uint8_t i = RTOS_NUM_TASKS;
+    rtos_tcb_t * const pT = &rtos_tcbAry[rtos_kernel_highestBit(*pWaiters)];
 
-    /* Linear scan from the top; waiter masks are tiny. */
-    do
-    {
-        -- i;
-        if(*pWaiters & rtos_tcbAry[i].bit)
-        {
-            /* makeReady clears the bit via pWaiters. */
-            RTOS_ASSERT(rtos_tcbAry[i].pWaiters == pWaiters);
-            rtos_kernel_makeReady(&rtos_tcbAry[i]);
-            return i;
-        }
-    }
-    while(i > 1);
-
-    RTOS_ASSERT(false);
-    return RTOS_NO_TASK;
+    RTOS_ASSERT(*pWaiters != 0  &&  pT != &rtos_tcbAry[RTOS_IDLE_TASK]);
+    RTOS_ASSERT(pT->pWaiters == pWaiters);              /* makeReady clears the bit via it */
+    rtos_kernel_makeReady(pT);
+    return pT;
 }
 
 
@@ -190,9 +178,8 @@ void rtos_mutexUnlock(rtos_mutex_t *pMutex)
     {
         /* Hand over to the highest waiter. It owns the mutex from this moment, so it runs
            at the ceiling from this moment: no task below the ceiling may get in between. */
-        rtos_tcb_t *pNext;
-        pMutex->owner = rtos_kernel_releaseHighestWaiter(&pMutex->waiters);
-        pNext = &rtos_tcbAry[pMutex->owner];
+        rtos_tcb_t * const pNext = rtos_kernel_releaseHighestWaiter(&pMutex->waiters);
+        pMutex->owner = pNext->prio;
         pMutex->savedPrio = pNext->effPrio;
         if(pMutex->ceiling > pNext->effPrio)
             pNext->effPrio = pMutex->ceiling;

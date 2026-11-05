@@ -14,6 +14,9 @@
 /** Initialize UART0 for 8N1 at \a baud. */
 void uart_init(uint32_t baud);
 
+/** The baud rate given to uart_init, or 115200 before the first call (ESP32). */
+uint32_t uart_currentBaud(void);
+
 void uart_putc(char c);
 
 /** Write a RAM string. */
@@ -33,6 +36,11 @@ void uart_putHex8(uint8_t b);
 
 /** Read a byte if one is available, else return -1. */
 int16_t uart_getc(void);
+
+/** Receive by interrupt instead of polling: \a fn is called in interrupt context with
+    every byte that arrives, from the moment it is set; NULL goes back to polling.
+    ESP32 (UART0) only so far: AVR and the host port keep polling. */
+void uart_onReceive(void (*fn)(uint8_t c, void *arg), void *arg);
 
 /** Block until every queued byte has been sent. */
 void uart_flush(void);

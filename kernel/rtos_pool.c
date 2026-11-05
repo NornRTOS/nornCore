@@ -96,8 +96,7 @@ void rtos_poolFreeFromIsr(rtos_pool_t *pPool, void *pBlock)
                );
     if(pPool->waiters != 0)
     {
-        const uint8_t id = rtos_kernel_releaseHighestWaiter(&pPool->waiters);
-        *(void **)rtos_tcbAry[id].pXfer = pBlock;
+        *(void **)rtos_kernel_releaseHighestWaiter(&pPool->waiters)->pXfer = pBlock;
     }
     else
     {

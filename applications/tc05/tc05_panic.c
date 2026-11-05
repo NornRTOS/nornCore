@@ -69,6 +69,7 @@ static void putReason(uint8_t reason)
     case RTOS_PANIC_WATCHDOG:       uart_puts("WATCHDOG"); break;
     case RTOS_PANIC_DEADLOCK:       uart_puts("DEADLOCK"); break;
     case RTOS_PANIC_FAULT:          uart_puts("FAULT"); break;
+    case RTOS_PANIC_CONFIG:         uart_puts("CONFIG"); break;
     case RTOS_PANIC_APPLICATION:    uart_puts("APPLICATION"); break;
     default:                        uart_puts("NONE"); break;
     }

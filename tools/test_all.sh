@@ -3,7 +3,7 @@
 #   host unit tests, then every applications/tc* in simavr for each AVR board, then on the
 #   ESP32 board if its serial port exists. Exit code 1 if anything failed.
 #
-#   TCS="tc01 tc02"        subset of test applications (default: all tc*)
+#   TCS="tc01 tc02"        subset of test applications (default: all tc* and sdk*)
 #   AVR_BOARDS="uno"       default "uno mega2560"
 #   ESP_PORT=/dev/ttyUSB0  ESP32 serial port; skipped when absent. ESP_PORT= disables.
 #   AVR_HW="mega2560:/dev/ttyACM0 uno:/dev/ttyACM1"
@@ -14,7 +14,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-TCS=${TCS:-$(ls -d applications/tc* | xargs -n1 basename)}
+TCS=${TCS:-$(ls -d applications/tc* applications/sdk* | xargs -n1 basename)}
 AVR_BOARDS=${AVR_BOARDS-"uno mega2560"}
 ESP_PORT=${ESP_PORT-/dev/ttyUSB0}
 AVR_HW=${AVR_HW-}

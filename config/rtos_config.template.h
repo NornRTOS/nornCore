@@ -23,8 +23,14 @@
     the kernel; hal/board.h offers timer 2 to the application. */
 /* #define RTOS_CFG_TIMER       3 */
 
-/** Fill stacks with a pattern at creation and support rtos_getStackFree. */
+/** Fill stacks with a pattern at creation and support rtos_getStackFree; 0 also drops
+    the stack bookkeeping from the TCB (a pointer and a size per task). */
 #define RTOS_CFG_STACK_CHECK    1
+
+/** Stack monitor: the idle task watches the high water marks and calls
+    rtos_stackWarnHook once per task whose untouched margin drops below
+    RTOS_PORT_STACK_WARN. Needs RTOS_CFG_STACK_CHECK. */
+#define RTOS_CFG_STACK_WARN     1
 
 /** Let the idle task sleep (SLEEP_MODE_IDLE) between interrupts. */
 #define RTOS_CFG_IDLE_SLEEP     1
@@ -39,7 +45,9 @@
 /** Compile kernel assertions. */
 #define RTOS_CFG_ASSERT         1
 
-/** Optional: a function void f(void) called in every idle loop iteration. */
+/** Optional: a function void f(void) called in every idle loop iteration. Source builds
+    only; without it the kernel calls the weak function rtos_idleHook, which a binary
+    (SDK) application overrides instead. */
 /* #define RTOS_CFG_IDLE_HOOK   myIdleHook */
 
 /** 0: a panic halts the CPU (development). 1: it resets the board; the reason survives
@@ -68,6 +76,9 @@
 
 /** Event groups: flags shared by several tasks (rtos_evgroup*). */
 #define RTOS_CFG_EVGROUPS       1
+
+/** Task notifications (rtos_notify*); 0 saves 2 bytes per task. */
+#define RTOS_CFG_NOTIFY         1
 
 /** rtos_suspend / rtos_resume. */
 #define RTOS_CFG_SUSPEND        1

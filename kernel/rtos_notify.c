@@ -14,6 +14,8 @@
 #include "rtos_assert.h"
 #include "rtos_kernel.h"
 
+#if RTOS_CFG_NOTIFY
+
 
 /**
  * Apply a notification to a task and wake it if it is waiting for one. Interrupts
@@ -112,3 +114,4 @@ bool rtos_notifyTake(rtos_tick_t timeout)
     rtos_port_exitCritical(cs);
     return ok;
 }
+#endif  /* RTOS_CFG_NOTIFY */

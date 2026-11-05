@@ -71,7 +71,10 @@ rtos_port_switchContext:
 /*
  * First code of every task. Entered through the retw of rtos_port_switchContext with the
  * stack pointer at the top of the task's stack (reloaded by the window underflow from the
- * fake caller frame), interrupts masked. The trampoline enables them.
+ * fake caller frame), interrupts masked. The trampoline enables them. (Calling the task
+ * function from here with call8, to spare the trampoline's 32 byte frame, breaks the
+ * window spill chain: the fake frame is a call4 frame, and the first spill of the task's
+ * window then reads an unwritten save slot. Tried 2026-11-04.)
  */
     .align  4
     .global _rtos_port_taskStart

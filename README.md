@@ -4,6 +4,11 @@ A small preemptive real time kernel for the ATmega2560 (Arduino Mega) and the AT
 (Arduino UNO), written in C99 with the context switch in assembler. No dependency on the Arduino core; only avr-libc. Grew out
 of the bTool brewing controller, whose application lives in applications/bTool.
 
+## Licence
+
+Business Source License 1.1 with the Additional Use Grant in LICENSE.md (Tenforward AB);
+third-party components in THIRD_PARTY_LICENSES.md.
+
 ## Layout
 
     kernel/        portable kernel, C99, no architecture knowledge: scheduler, time, events
@@ -54,11 +59,17 @@ layer needs nothing per board: RAMPZ and the 3 byte return address are selected 
 compiler's MCU macros.
 
     esp32      ESP32-D0WDQ6, dual core Xtensa LX6, 520 KB RAM, 4 MB flash. NodeMCU-32S
-               style devkit with CP2102 on /dev/ttyUSB0, LED on GPIO2. CPU_MHZ=160 by
-               default from the PLL (port_clock.c); 80 and 40 work, 240 is experimental.
+               style devkit with CP2102 on /dev/ttyUSB0, LED on GPIO2. CPU_MHZ=240 by
+               default from the PLL (port_clock.c); 40, 80 and 160 work as well.
 
 The ESP32 image is loaded by the ROM directly into IRAM/DRAM from flash offset 0x1000; no
-second stage bootloader, no ESP-IDF, no FreeRTOS. The kernel runs on the PRO CPU; the APP
+second stage bootloader, no ESP-IDF, no FreeRTOS. Code that does not fit the 128 KB of
+IRAM can run from flash through the cache: the objects and archives an application or a
+module names in FLASH_OBJS (and functions marked RTOS_PORT_FLASH_TEXT) go to a second
+image at FLASH_BASE (0x80000), which `upload` writes too and `sim` places in the QEMU
+flash; rtos_port_flashInit maps it through the flash MMU before main (esp32.ld,
+port_esp32.c, tc09). The kernel, the port and interrupt handlers stay in IRAM. The
+kernel runs on the PRO CPU; the APP
 CPU is held in reset until a second nornOS instance gets a job there. Peripheral
 interrupts are routed with rtos_port_attachInterrupt to level 1 CPU interrupts and
 dispatched to RTOS_ISR bodies. A context switch spills every live register window first
@@ -82,6 +93,39 @@ embedded in the core 0 image, which copies it into place and starts the APP CPU 
 (rtos_port_startAppCpu). hal/xtensa/amp.c is the link: one ring buffer per direction in
 the shared window, 16 byte messages, the receiver woken by the other core's FROM_CPU
 interrupt. tc07 shows it: 200 requests per second answered by core 1, 10 us round trip.
+
+## Configuration profiles and the kernel library
+
+An application normally carries its own rtos_config.h and compiles the kernel with it.
+For the binary SDK the configuration is frozen into profiles instead: one rtos_config.h
+per board and profile under config/profiles/<board>/<name>/ (esp32, mega2560 and uno,
+each with `default` and `small`; esp32 also `full`: 31 tasks, tracing, tickless idle),
+and the kernel, port and HAL are built from it into a library:
+
+    make lib BOARD=esp32 PROFILE=default      build/lib-default-esp32/libnornCore.a
+    make APP=sdk01 BOARD=esp32                an application built the SDK way: app.mk says
+                                              PROFILE = default and USE_LIB = 1, it has no
+                                              rtos_config.h, compiles against the profile's
+                                              and links the library (built on demand)
+
+What a profile fixes: the number of tasks (and with it the width of the task masks in
+every object), tick and event widths, every optional feature, the tick rate and the
+board's clock and timer. What the application still decides: its tasks, their stacks and
+priorities up to RTOS_PRIO_APP_MAX, the hooks. The hooks of a binary kernel are functions,
+not macros: rtos_idleHook (replaces RTOS_CFG_IDLE_HOOK, which only a source build can
+use), rtos_stackWarnHook, rtos_panicHook, rtos_assertFailed, all weak with a default.
+
+Each profile ends with a priority map: the tasks of the nornOS modules sit at the top
+(RTOS_PRIO_WIFI_RADIO 15, RTOS_PRIO_WIFI_SERVICE 14, RTOS_PRIO_NET 13 in esp32/default)
+and the application uses 1..RTOS_PRIO_APP_MAX; nornNET and nornWIFI read these names
+when their own configuration does not set a priority.
+
+rtos_init passes RTOS_CONFIG_SIGNATURE, every layout changing option folded into one
+number, to the kernel; a library built from another profile than the one the
+application compiled against panics at once with RTOS_PANIC_CONFIG (both signatures in
+the record) instead of corrupting memory. The library is linked whole (--whole-archive)
+so that the vector tables and the weak defaults are present; --gc-sections still drops
+what the image does not use.
 
 ## Model
 
@@ -142,6 +186,9 @@ What the kernel does when things go wrong, all optional per configuration:
     stack canary       RTOS_CFG_STACK_CHECK 2: the bottom of every stack is checked at
                        each context switch and tick; overflow = RTOS_PANIC_STACK_OVERFLOW
                        with the task id, long before the corruption reaches a neighbour.
+    stack monitor      RTOS_CFG_STACK_WARN: the idle task watches the high water marks and
+                       calls rtos_stackWarnHook once per task whose untouched margin
+                       falls below the port's warning level, before anything overflows.
     watchdog           RTOS_CFG_WATCHDOG: hardware watchdog fed by the idle task, plus
                        rtos_wdtMonitor/rtos_wdtCheckIn deadlines per task. A late task is
                        reported by name (RTOS_PANIC_WATCHDOG) while the system still runs;
@@ -178,37 +225,156 @@ Three layers, all run by `make test-all` (about a minute with an ESP32 connected
     test/test_robust.c robustness features on the host port, one child process per
                        scenario: deadlock, stack canary, task watchdog, timer task,
                        statistics and binary semaphore, task info, trace, assertion
+    test/test_api.c    contract test: every public function called as the header documents
+                       it, return values and object statistics checked directly: polling
+                       with RTOS_NO_WAIT, timeouts, the *FromIsr variants, run time
+                       initializers, overrun counting, task info
+    test/test_wrap.c   tick counter wrap-around: with 16 bit ticks the counter starts 50
+                       ticks before a wrap and runs through four of them while periodic
+                       waits, delays, timeouts, a periodic and a one shot timer and the
+                       task watchdog are in use, every interval checked to the tick;
+                       test_wrap32 is the same source across the 2^32 wrap
     test/test_stress.c randomized stress test on the host port: six tasks pick random
-                       operations on every primitive with random timeouts, the idle hook
-                       injects random interrupts, and the kernel invariants are checked
-                       after every operation and interrupt (ready mask, timed list, waiter
-                       masks, ceiling priorities, pool and queue accounting, run time sum).
-                       Queue items and pool blocks carry stamps that must survive. The
-                       sequence is fixed by SEED, so a failure reproduces.
+                       operations on every primitive (semaphore, mutex, queue, mailbox,
+                       pool, event group, heap, events, notifications, periodic waits,
+                       suspend/resume, software timers) with random timeouts, the idle
+                       hook injects random interrupts, and the kernel invariants are
+                       checked after every operation and interrupt (ready mask, timed
+                       list, waiter masks, ceiling priorities, suspended tasks, pool,
+                       queue and heap accounting, run time sum). Queue items and pool and
+                       heap blocks carry stamps that must survive. The sequence is fixed
+                       by SEED, so a failure reproduces; 8 seeds x 200000 ticks pass.
     applications/tc*   on the target: each test case checks its own counters at the end
                        and prints RESULT tcNN PASS or FAIL (hal/testresult.h), then halts,
                        which ends a simavr run. tools/test_all.sh collects the lines.
+
+`make host-cov` builds the host tests with gcov and prints the line coverage of every
+kernel file and the uncovered line ranges (tools/host_cov.sh); the kernel is at 98.8 %,
+the rest being the reset paths of rtos_panic.c, which the host cannot take, and the
+stack realignment that only the ESP32 needs. `make analyze` runs gcc's static analyzer
+(-fanalyzer) over the kernel, the ports and the HAL with each architecture's compiler
+(tools/analyze.sh); it reports nothing on any of them.
 
 tc01..tc06 pass on a real Mega 2560 with the same counters as simavr, on the ESP32 board
 and in QEMU. Not covered yet: a real UNO, and static analysis beyond the compiler warnings
 (cppcheck is not installed here). .github/workflows/ci.yml runs the host tests, simavr
 and QEMU on every push. doc/porting.md describes the port interface.
 
-## Timing (tc04)
+## Timing (tc04, tc10)
 
-Measured by applications/tc04 with everything else in the test running at the same time.
-switch = one context switch including the semaphore give/take around it; isrLatency =
-hardware event to the first line of the RTOS_ISR body; jitter = how late a 10 ms
-rtos_waitPeriodic task wakes relative to the ideal grid. simavr is cycle accurate for the
-AVR; the ESP32 figures are from the board on the 40 MHz crystal.
+tc10 measures the kernel in CPU cycles with a cycle counter and a probe interrupt whose
+period is dithered so that it lands at every phase of the tick and of the other activity
+(hal/<arch>/board.h: timer 1 and timer 4 on the Mega, CCOUNT and the application timer
+on the ESP32). All figures are taken with everything in the test running at once: the
+switch benchmark, the probe at ~770 Hz, the tick, and the default configuration (stack
+fill, run time statistics, assertions, software timers). simavr is cycle accurate and
+gives the same numbers as the board.
+
+    mega2560, 16 MHz                      cycles        time
+    switch (sem give/take, per switch)    423 min       26.4 us   470 avg
+    switch (notify)                       411 min       25.7 us
+    switch (queue, 1 byte item)           522 min       32.6 us
+    isr entry (event to RTOS_ISR body)    50 min        3.1 us    max seen 31 us
+    isr -> task (give in ISR to task)     443 min       27.7 us   max seen 44 us
+    hw event -> task, best case                         31 us
+    api, no switch: sem give+take 133, notify 200, mutex lock+unlock 186,
+                    queue send+recv 429, mbox 269, pool alloc+free 461,
+                    evgroup set+wait 260, timer start+stop 222, getTick 21
+    ram: tcb 42 B/task; sem 4, mutex 4, queue 12, mbox 7, pool 12, timer 18, evgroup 3;
+         min stack 96 B; the benchmark tasks use 36-55 B of stack plus what they print with
+
+Stack per task (tc11, bytes left on the stack by the kernel and the port; the task's own
+frames come on top). An interrupt lands on the stack of the running task, so every task
+needs the "interrupted" figure plus its own use; the ESP32 figures are from QEMU, which
+is exact for stack use:
+
+    board      only blocks   woken from ISR   interrupted while running   RTOS_PORT_MIN_STACK
+    uno        30            32               40                          96
+    mega2560   34            38               44                          96
+    esp32      192           192              336                         512   (board)
+    esp32      300           300              336                         512   (QEMU)
+
+QEMU spills register windows earlier than the chip (its register file is smaller), so
+its blocking figure is higher than the board's; the interrupt figure is the same.
+
+### Stacks
+
+What a task needs is its own frames plus what the kernel and the port leave under them
+when it is interrupted (tc11, tc12). The port gives three sizes, and `rtos.h` names them
+RTOS_STACK_MIN, RTOS_STACK_DEFAULT and RTOS_STACK_LARGE:
+
+    level                 esp32     mega2560/uno   meant for
+    technical minimum     512 B     96 B           very simple tasks whose stack use has
+                                                   been measured and is bounded: on the
+                                                   ESP32 it leaves 96 bytes, two call8
+                                                   frames, beyond the preemption case
+    default               1024 B    192 B          an ordinary task; start here
+    complex tasks         2048 B+   384 B+         recommended starting size for tasks
+                                                   that print, nest calls, use floating
+                                                   point or big locals; no upper bound:
+                                                   tc12 shows 32 nested frames alone
+                                                   take 1.4 KB on the ESP32, and crypto
+                                                   or network tasks need more
+    stack monitor         high water mark (rtos_getStackFree, rtos_getTaskInfo) plus a
+                          warning: with RTOS_CFG_STACK_WARN the idle task reads one task's
+                          mark per loop and calls rtos_stackWarnHook once for a task whose
+                          untouched margin drops below RTOS_PORT_STACK_WARN (96 B on the
+                          ESP32, 24 B on the AVR); RTOS_CFG_STACK_CHECK 2 adds the canary
+                          that turns an actual overflow into a panic
+
+The minimum is what the kernel accepts, not a promise: nornOS does not guarantee that
+every application works with it, and none of the levels is a limit in the other
+direction. Size a task from the default, run it, read the high water mark, and keep a
+margin of at least the warning level.
+
+tc12 repeats this at the bottom of a call chain 0, 4, 8, 16 and 32 frames deep: the
+kernel and port share stays the same at every depth (ESP32: 416 bytes preempted with a
+switch out of the interrupt, 240 blocking, 416 with floating point, each including the
+two bottom frames of the task itself; Mega: 56, 46, 65), so the rule for a stack is the
+task's own frames (48 bytes per call8 level with a few locals; the register file absorbs
+the first four) plus the "interrupted while running" figure. Interrupts do not nest on
+either port, a second source waits and runs on the same spot.
+
+On the ESP32 a call8 frame is 32 bytes and the interrupt frame 176, and the switch spills
+every live window, so the blocking path (task, semTake, blockCurrent, switchContext) costs
+what a whole AVR stack does. The port inlines the scheduler into the blocking path, the
+interrupt dispatcher and the ISR tail into the exception handler (one frame each); the
+trampoline frame under every task cannot go without breaking the window spill chain.
+
+    esp32, 240 MHz                        cycles        time
+    switch (sem give/take, per switch)    405 min       1.69 us   406 avg
+    switch (notify)                       415 min       1.73 us
+    switch (queue, 1 byte item)           457 min       1.90 us
+    isr entry (event to RTOS_ISR body)    35 avg        0.9 us    max seen 1.5 us
+    isr -> task (give in ISR to task)     417 min       1.74 us   max seen 3.2 us
+    hw event -> task, best case                         1.85 us
+    api, no switch: sem give+take 109, notify 141, mutex lock+unlock 138,
+                    queue send+recv 279, mbox 191, pool alloc+free 153,
+                    evgroup set+wait 134, timer start+stop 124, getTick 21
+    ram: tcb 72 B/task; sem 4, mutex 4, queue 16, mbox 12, pool 20, timer 28, evgroup 4;
+         min stack 512 B; the benchmark tasks use 300-448 B of stack
+
+The ESP32 figures are from the board after the hot path work (2026-11-04 evening, the
+switch was 456 cycles before it); the entry minimum reads 0 because the probe timer's
+40 MHz counter is latched at the alarm. doc/esp32_hotpath.md has the static review that
+preceded the measurement.
+
+Where the cycles go on the AVR, per switch: ~105 in port_context.S (19 registers each
+way), ~45 in the run time statistics (RTOS_CFG_RUNTIME_STATS 0 saves them), ~20 in
+assertions (RTOS_CFG_ASSERT 0), the rest in the scheduler, the wait list and the
+primitive. With statistics and assertions off: 322 cycles (20 us). The max of the ISR
+entry is the longest interrupt-off window: a switch (~27 us) that a tick with a wake-up
+lands behind. tc04 is the older, coarser test (4 us counter) and still runs everywhere:
 
     board      switch avg   isrLatency max   jitter max   notes
-    uno        28 us        24 us            28 us        simavr, 4 us counter resolution
-    mega2560   32 us        16 us            20 us        simavr, 8 us ISR counter resolution
-    mega2560   32 us        24 us            24 us        real board
-    esp32      10.9 us      12 us            5 us         40 MHz crystal
-    esp32      2.9 us       4 us             2 us         160 MHz (default)
-    esp32      1.9 us       2 us             0 us         240 MHz (experimental)
+    uno        24 us        24 us            16 us        simavr
+    mega2560   24 us        24 us            16 us        simavr and real board
+    esp32      10.9 us      12 us            5 us         40 MHz crystal, before the hot path work
+    esp32      2.9 us       4 us             2 us         160 MHz, before the hot path work
+    esp32      1.7 us       2 us             0 us         240 MHz (default), board 2026-11-04
+
+QEMU is not cycle accurate and stalls when the host is busy: its tc04/tc10 figures mean
+nothing, and a heavy parallel build on the host can even fail their latency limits.
 
 ## Applications (applications/)
 
@@ -221,6 +387,17 @@ AVR; the ESP32 figures are from the board on the 40 MHz crystal.
     tc07   ESP32 only: a second nornOS instance on the APP CPU answering requests over
            the shared memory link (ONLY_BOARDS in app.mk keeps it off the AVR boards)
     tc08   heap, event groups, suspend/resume and tickless idle together
+    tc09   ESP32 only: code and constants running from flash through the cache
+    tc10   kernel benchmark in cycles: API cost, switch, ISR entry and ISR-to-task latency,
+           RAM per object (Mega and ESP32; the UNO lacks the free timers)
+    tc11   stack need per task: what a task that only blocks, one that is woken from an
+           interrupt and one that is interrupted while running leave on their stacks
+    tc12   the same on top of a call chain 0..32 frames deep, in four phases: the chain
+           alone, preempted at the bottom, blocking at the bottom, floating point at the
+           bottom (Mega and ESP32)
+    sdk01  built like an SDK application: no rtos_config.h, the default profile's
+           library, the hooks as functions; checks the signature, the hooks and the
+           primitives (every board)
            (tc01..tc04 use the application timer of hal/<arch>/board.h and run on every board)
     tc02   queue fed from an ISR with deliberate overflow, mailbox between tasks
     tc03   task notifications from ISR and timers, one shot and periodic software timers
@@ -231,6 +408,9 @@ to 0 for hardware. bTool runs forever.
 
 ## Context switch cost
 
-Voluntary switch (a task blocks): 18 call-saved registers + SREG, about 100 cycles.
-Preemption by an ISR: the RTOS_ISR wrapper saves the 15 call-clobbered registers, SREG and
-RAMPZ, and only if a switch is needed the call-saved half as well.
+Voluntary switch (a task blocks): 18 call-saved registers + SREG, about 105 cycles on the
+AVR. Preemption by an ISR: the RTOS_ISR wrapper saves the 15 call-clobbered registers, SREG
+and RAMPZ, and only if a switch is needed the call-saved half as well. Interrupts stay off
+from the kernel call that decides to switch until the task that is switched to leaves
+its own kernel call, so the switch cost is also the worst interrupt-off window; tc10
+prints both.

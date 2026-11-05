@@ -32,6 +32,16 @@
     room for the task's own calls. */
 #define RTOS_PORT_MIN_STACK     96u
 
+/** Recommended starting sizes (see README "Stacks"): the default for an ordinary task,
+    and for a task that prints, nests calls or does software floating point. Neither is
+    an upper bound. */
+#define RTOS_PORT_DEFAULT_STACK 192u
+#define RTOS_PORT_LARGE_STACK   384u
+
+/** Stack monitor: warn when fewer than this many bytes of a stack were never touched;
+    one interrupt frame, i.e. the next interrupt may overflow. */
+#define RTOS_PORT_STACK_WARN    24u
+
 /** Stack frame alignment required by the ABI; the AVR has none. */
 #define RTOS_PORT_STACK_ALIGN   1u
 
@@ -50,7 +60,42 @@
 
 /** Frequency of rtos_port_getRunTimeCounter: the tick timer counts at F_CPU/64. 32 bits
     wrap after 4.7 hours at 16 MHz; the kernel only uses differences. */
-#define RTOS_PORT_RUNTIME_HZ    (F_CPU / 64ul)
+#define RTOS_PORT_TIMER_PRESCALER   64ul
+#define RTOS_PORT_RUNTIME_HZ        (F_CPU / RTOS_PORT_TIMER_PRESCALER)
+#define RTOS_PORT_TIMER_TOP         (F_CPU / RTOS_PORT_TIMER_PRESCALER / RTOS_CFG_TICK_HZ - 1ul)
+
+/*
+ * Tick timer selection: RTOS_CFG_TIMER is one of the 16 bit timers of the MCU: 1, 3, 4 or
+ * 5 on the ATmega2560, only 1 on the ATmega328P. Left undefined it defaults to 3 where that
+ * exists (keeps timer 1 free for PWM on the Mega) and to 1 otherwise. The register names
+ * are built here so that the run time counter can be read inline.
+ */
+#ifndef RTOS_CFG_TIMER
+# if defined(TCCR3A)
+#  define RTOS_CFG_TIMER 3
+# else
+#  define RTOS_CFG_TIMER 1
+# endif
+#endif
+
+#define RTOS_PORT_CAT2_(a, b)       a##b
+#define RTOS_PORT_CAT2(a, b)        RTOS_PORT_CAT2_(a, b)
+#define RTOS_PORT_CAT3_(a, b, c)    a##b##c
+#define RTOS_PORT_CAT3(a, b, c)     RTOS_PORT_CAT3_(a, b, c)
+
+#define RTOS_PORT_TCCRnA      RTOS_PORT_CAT3(TCCR, RTOS_CFG_TIMER, A)
+#define RTOS_PORT_TCCRnB      RTOS_PORT_CAT3(TCCR, RTOS_CFG_TIMER, B)
+#define RTOS_PORT_TCNTn       RTOS_PORT_CAT2(TCNT, RTOS_CFG_TIMER)
+#define RTOS_PORT_OCRnA       RTOS_PORT_CAT3(OCR,  RTOS_CFG_TIMER, A)
+#define RTOS_PORT_TIMSKn      RTOS_PORT_CAT2(TIMSK, RTOS_CFG_TIMER)
+#define RTOS_PORT_TIFRn       RTOS_PORT_CAT2(TIFR, RTOS_CFG_TIMER)
+#define RTOS_PORT_OCIEnA      RTOS_PORT_CAT3(OCIE, RTOS_CFG_TIMER, A)
+#define RTOS_PORT_OCFnA       RTOS_PORT_CAT3(OCF,  RTOS_CFG_TIMER, A)
+#define RTOS_PORT_WGMn2       RTOS_PORT_CAT3(WGM,  RTOS_CFG_TIMER, 2)
+#define RTOS_PORT_CSn1        RTOS_PORT_CAT3(CS,   RTOS_CFG_TIMER, 1)
+#define RTOS_PORT_CSn0        RTOS_PORT_CAT3(CS,   RTOS_CFG_TIMER, 0)
+#define RTOS_PORT_TICK_VECT   RTOS_PORT_CAT3(TIMER, RTOS_CFG_TIMER, _COMPA_vect)
+
 
 /** Place a string literal in flash. Used for assertion messages. */
 #define RTOS_PORT_STR(s)        PSTR(s)
@@ -218,8 +263,24 @@ rtos_port_ctx_t rtos_port_initStack(uint8_t *stackArea, size_t stackSize, void (
 /** Configure and start the tick timer. */
 void rtos_port_startTimer(void);
 
-/** Free running time at RTOS_PORT_RUNTIME_HZ. Interrupts must be disabled. */
-rtos_port_runtime_t rtos_port_getRunTimeCounter(void);
+/** Run time counter value at the last tick, maintained by the tick ISR (port_avr.c). */
+extern rtos_port_runtime_t rtos_port_runBase;
+
+/** Free running time at RTOS_PORT_RUNTIME_HZ. Interrupts must be disabled. Inline: it is
+    read at every context switch. */
+static inline rtos_port_runtime_t rtos_port_getRunTimeCounter(void)
+{
+    rtos_port_runtime_t base = rtos_port_runBase;
+    uint16_t cnt = RTOS_PORT_TCNTn;
+
+    if(RTOS_PORT_TIFRn & _BV(RTOS_PORT_OCFnA))
+    {
+        /* A tick is pending but not yet counted. */
+        base += RTOS_PORT_TIMER_TOP + 1ul;
+        cnt = RTOS_PORT_TCNTn;
+    }
+    return base + cnt;
+}
 
 /** Reset the MCU through the watchdog. Never returns. */
 void rtos_port_reset(void) __attribute__((noreturn));

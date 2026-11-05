@@ -21,6 +21,20 @@
 #include "port.h"
 
 /*
+ * Calling contexts, the rule for the whole API: a function without a FromIsr suffix is for
+ * task context and may block or switch task at once. Inside an RTOS_ISR body, a software
+ * timer callback running in the tick (RTOS_CFG_TIMER_TASK_PRIO 0) and the trace hook,
+ * only the *FromIsr variants, rtos_timerStart/Stop, rtos_getTick, rtos_getTimeUs, the
+ * plain readers (rtos_queueCount, rtos_mboxIsFull, rtos_poolFreeCount, rtos_evgroupGet,
+ * rtos_timerIsActive, rtos_timerRemaining) and rtos_panic are allowed; they never block
+ * and never switch, the switch happens once at the end of the ISR. The idle task (the
+ * context of rtos_start, the idle hook) must never block either. Task ids are 1 to
+ * RTOS_CFG_NUM_TASKS; every function that takes one asserts it (RTOS_CFG_ASSERT), the
+ * diagnostics accept the idle task 0 as well, and rtos_getTaskInfo reports an invalid id
+ * by returning false instead.
+ */
+
+/*
  * Defines
  */
 
@@ -35,6 +49,19 @@
 
 /** Pseudo task id meaning "no task". */
 #define RTOS_NO_TASK            0xFFu
+
+/** Stack sizes, from the port (README "Stacks"): RTOS_STACK_MIN is the technical minimum
+    the kernel accepts, enough for the kernel and the port plus a few frames of the
+    task's own and meant for very simple tasks whose use has been measured;
+    RTOS_STACK_DEFAULT is the size to start from; RTOS_STACK_LARGE is the recommended
+    starting size for tasks that print, nest calls or use floating point, not an upper
+    bound: a deep enough call chain or a crypto or network task needs more (tc12 shows
+    32 nested frames alone take 1.4 KB on the ESP32). The minimum is not a promise that
+    every application works with it. Measure with rtos_getStackFree, the stack monitor,
+    tc11 and tc12. */
+#define RTOS_STACK_MIN          RTOS_PORT_MIN_STACK
+#define RTOS_STACK_DEFAULT      RTOS_PORT_DEFAULT_STACK
+#define RTOS_STACK_LARGE        RTOS_PORT_LARGE_STACK
 
 /** Timeout value meaning "wait forever". */
 #define RTOS_FOREVER            ((rtos_tick_t)-1)
@@ -188,6 +215,9 @@ typedef enum rtos_panicReason
     RTOS_PANIC_WATCHDOG,        /**< arg1: task that did not check in, RTOS_NO_TASK: idle. */
     RTOS_PANIC_DEADLOCK,        /**< arg1: task that would block, arg2: task it waits for. */
     RTOS_PANIC_FAULT,           /**< CPU exception; arg1: cause, arg2: address (port). */
+    RTOS_PANIC_CONFIG,          /**< rtos_init: the application was compiled against another
+                                     configuration than the kernel; arg1: the application's
+                                     signature, arg2: the kernel's (RTOS_CONFIG_SIGNATURE). */
     RTOS_PANIC_APPLICATION      /**< rtos_panic called by the application; args are its own. */
 } rtos_panicReason_t;
 
@@ -280,8 +310,11 @@ typedef struct rtos_taskInfo
 
 /* --- Kernel life cycle ------------------------------------------------------------- */
 
-/** Reset all kernel data. Call once before creating tasks. */
-void rtos_init(void);
+/** Reset all kernel data. Call once before creating tasks. The macro passes the
+    configuration signature of the application's rtos_config.h; a kernel built from
+    another configuration (a library of another profile) panics with RTOS_PANIC_CONFIG. */
+void rtos_initChecked(uint32_t configSignature);
+#define rtos_init()     rtos_initChecked(RTOS_CONFIG_SIGNATURE)
 
 /** Register a task. prio is 1..RTOS_CFG_NUM_TASKS and must be unique. The stack area must
     live as long as the system runs. */
@@ -305,8 +338,10 @@ rtos_tick_t rtos_getTick(void);
 void rtos_delay(rtos_tick_t ticks);
 
 /** Block the calling task until the next period boundary. The boundary is computed from the
-    previous boundary (or the task start) plus \a period, so the task runs drift free
-    regardless of its execution time. Returns true if the boundary was already in the past
+    previous boundary plus \a period, so the task runs drift free regardless of its
+    execution time. The first boundary is the task start plus \a period: a task whose
+    start up work takes longer than one period therefore sees an overrun at its first call
+    (harmless, it just re-bases). Returns true if the boundary was already in the past
     (task overrun). In that case the task continues immediately and the next boundary is
     re-based on now. */
 bool rtos_waitPeriodic(rtos_tick_t period);
@@ -347,6 +382,8 @@ void rtos_semGiveFromIsr(rtos_sem_t *pSem);
 
 /* --- Ceiling mutex ------------------------------------------------------------------- */
 
+/** Initialize at run time, as an alternative to RTOS_MUTEX_INIT. \a ceilingPrio is the
+    highest priority of any task that will ever lock the mutex. */
 void rtos_mutexInit(rtos_mutex_t *pMutex, uint8_t ceilingPrio);
 
 /** Lock the mutex. With a correct ceiling this never blocks: while a task holds the mutex
@@ -354,10 +391,14 @@ void rtos_mutexInit(rtos_mutex_t *pMutex, uint8_t ceilingPrio);
     holding several mutexes. */
 void rtos_mutexLock(rtos_mutex_t *pMutex);
 
+/** Unlock the mutex: the owner's priority drops back, and if a task waited (ceiling too
+    low) it becomes the owner at once and may preempt. Only the owner may unlock. */
 void rtos_mutexUnlock(rtos_mutex_t *pMutex);
 
 /* --- Message queue ------------------------------------------------------------------ */
 
+/** Initialize at run time, as an alternative to RTOS_QUEUE_INIT; \a storage holds
+    itemSize * capacity bytes, capacity is at most 255. */
 void rtos_queueInit(rtos_queue_t *pQ, uint8_t *storage, uint8_t itemSize, uint8_t capacity);
 
 /** Copy an item into the queue. Blocks up to \a timeout ticks if the queue is full.
@@ -380,6 +421,8 @@ uint8_t rtos_queueCount(const rtos_queue_t *pQ);
 
 /* --- Mailbox ----------------------------------------------------------------------------- */
 
+/** Initialize at run time, as an alternative to RTOS_MBOX_INIT; \a storage holds one
+    item of itemSize bytes. */
 void rtos_mboxInit(rtos_mbox_t *pMb, uint8_t *storage, uint8_t itemSize);
 
 /** Put an item in the mailbox, replacing any unread one. Never blocks. If a task is
@@ -387,7 +430,7 @@ void rtos_mboxInit(rtos_mbox_t *pMb, uint8_t *storage, uint8_t itemSize);
     overwritten. */
 bool rtos_mboxPost(rtos_mbox_t *pMb, const void *pItem);
 
-/** Post from inside an RTOS_ISR body. */
+/** Post from inside an RTOS_ISR body; true if an unread item was overwritten. */
 bool rtos_mboxPostFromIsr(rtos_mbox_t *pMb, const void *pItem);
 
 /** Take the item out of the mailbox, blocking up to \a timeout ticks if it is empty.
@@ -397,7 +440,7 @@ bool rtos_mboxFetch(rtos_mbox_t *pMb, void *pItem, rtos_tick_t timeout);
 /** True if the mailbox holds an unread item. */
 bool rtos_mboxIsFull(const rtos_mbox_t *pMb);
 
-/* --- Task notification ----------------------------------------------------------------- */
+/* --- Task notification (RTOS_CFG_NOTIFY) ----------------------------------------------- */
 
 /** Apply \a op with \a value to the notification value of a task and wake it if it is
     waiting. May cause an immediate task switch. */
@@ -416,14 +459,19 @@ bool rtos_notifyTake(rtos_tick_t timeout);
 
 /* --- Software timers ------------------------------------------------------------------ */
 
+/** Prepare a timer object (inactive) with its callback and argument. The callback must
+    not be NULL. Not for a timer that is active. */
 void rtos_timerInit(rtos_timer_t *pT, rtos_timerFunc_t callback, void *arg);
 
-/** Arm the timer to fire after \a delay ticks and then every \a period ticks (0 for one
-    shot). Restarts a running timer. Usable from tasks and from ISR bodies. */
+/** Arm the timer to fire after \a delay ticks (delay..delay+1, as rtos_delay) and then
+    every \a period ticks exactly (0 for one shot). Restarts a running timer. Usable from
+    tasks and from ISR bodies. */
 void rtos_timerStart(rtos_timer_t *pT, rtos_tick_t delay, rtos_tick_t period);
 
+/** Disarm the timer; nothing happens if it is not active. Usable from ISR bodies. */
 void rtos_timerStop(rtos_timer_t *pT);
 
+/** True between rtos_timerStart and the expiry of a one shot timer or rtos_timerStop. */
 bool rtos_timerIsActive(const rtos_timer_t *pT);
 
 /** Ticks until the next expiry, 0 if not active or due. */
@@ -443,22 +491,28 @@ void *rtos_poolAllocFromIsr(rtos_pool_t *pPool);
 /** Return a block. If a task waits for one it gets this block directly. */
 void rtos_poolFree(rtos_pool_t *pPool, void *pBlock);
 
+/** Return a block from inside an RTOS_ISR body. */
 void rtos_poolFreeFromIsr(rtos_pool_t *pPool, void *pBlock);
 
+/** Number of free blocks now. */
 uint8_t rtos_poolFreeCount(const rtos_pool_t *pPool);
 
 /* --- Event groups (RTOS_CFG_EVGROUPS) ---------------------------------------------- */
 
+/** Initialize at run time, as an alternative to RTOS_EVGROUP_INIT. */
 void rtos_evgroupInit(rtos_evgroup_t *pG, rtos_evt_t initialBits);
 
 /** Set bits; every waiter whose condition is now met is woken, highest priority first.
     A waiter with RTOS_WAIT_CLEAR takes its bits out of the group as it is woken. */
 void rtos_evgroupSet(rtos_evgroup_t *pG, rtos_evt_t bits);
+
+/** As rtos_evgroupSet, from inside an RTOS_ISR body. */
 void rtos_evgroupSetFromIsr(rtos_evgroup_t *pG, rtos_evt_t bits);
 
 /** Clear bits; nobody is woken. */
 void rtos_evgroupClear(rtos_evgroup_t *pG, rtos_evt_t bits);
 
+/** The bits currently set. */
 rtos_evt_t rtos_evgroupGet(const rtos_evgroup_t *pG);
 
 /** Wait for any (RTOS_WAIT_ANY) or all (RTOS_WAIT_ALL) bits of \a mask, optionally
@@ -473,8 +527,10 @@ rtos_evt_t rtos_evgroupWait(rtos_evgroup_t *pG, rtos_evt_t mask, uint8_t options
     itself. Not the idle task. */
 void rtos_suspend(uint8_t taskId);
 
-/** Let a suspended task run again (if it is not still blocked). */
+/** Let a suspended task run again (if it is not still blocked). May switch at once. */
 void rtos_resume(uint8_t taskId);
+
+/** As rtos_resume, from inside an RTOS_ISR body. */
 void rtos_resumeFromIsr(uint8_t taskId);
 
 /* --- Heap (RTOS_CFG_HEAP) ----------------------------------------------------------- */
@@ -484,8 +540,11 @@ void rtos_heapInit(void *area, size_t size);
 
 /** First fit allocation with coalescing on free; NULL if nothing fits. Task context. */
 void *rtos_malloc(size_t size);
+
+/** Return a block from rtos_malloc; NULL is ignored. Task context. */
 void rtos_free(void *p);
 
+/** Totals, free space, low water mark and the call counts. */
 void rtos_heapStats(rtos_heapStats_t *pStats);
 
 /* --- Diagnostics -------------------------------------------------------------------- */
@@ -500,7 +559,8 @@ uint8_t rtos_getOverrunCount(uint8_t taskId, bool reset);
     RTOS_CFG_STACK_CHECK. Returns 0 for the idle task. */
 size_t rtos_getStackFree(uint8_t taskId);
 
-/** Microseconds since start, derived from the tick counter and the timer register. */
+/** Microseconds since start, derived from the tick counter and the timer register (wraps
+    after 71 minutes; use differences). Usable from ISR bodies. */
 uint32_t rtos_getTimeUs(void);
 
 /** Accumulated run time of a task in counts of RTOS_RUNTIME_HZ, measured at every
@@ -531,12 +591,25 @@ uint8_t rtos_getResetCause(void);
 
 /* --- Hooks ----------------------------------------------------------------------------- */
 
-/** Called by the kernel when an assertion fails. The default calls rtos_panic. */
-void rtos_assertFailed(const char *file, uint16_t line);
+/** Called by the kernel when an assertion fails. The default calls rtos_panic. An
+    application that overrides it must not return either: the kernel is in an undefined
+    state, and the compiler relies on it (the attribute keeps the checks cheap). */
+void rtos_assertFailed(const char *file, uint16_t line) __attribute__((noreturn, cold));
 
 /** Called by rtos_panic with interrupts disabled before the halt or reset. The weak
     default does nothing; applications print the information here. Must not block. */
 void rtos_panicHook(const rtos_panicInfo_t *pInfo);
+
+/** Called in every idle loop iteration when RTOS_CFG_IDLE_HOOK is not defined (a binary
+    kernel cannot take a macro): the weak default does nothing, an application overrides
+    it to drive sensors, feed a console or sleep. Runs in the idle task: must not block. */
+void rtos_idleHook(void);
+
+/** Stack monitor (RTOS_CFG_STACK_WARN with RTOS_CFG_STACK_CHECK): the idle task reads
+    the high water mark of one task per idle loop and calls this hook, once per task, when
+    fewer than RTOS_PORT_STACK_WARN bytes of its stack were never touched. The weak default
+    does nothing; applications print or log here. Runs in the idle task: must not block. */
+void rtos_stackWarnHook(uint8_t task, size_t stackFree);
 
 /* --- Watchdog (RTOS_CFG_WATCHDOG) --------------------------------------------------- */
 
@@ -561,9 +634,9 @@ void rtos_wdtCheckIn(void);
 #define RTOS_TRACE_TIMER    4u  /**< a: timer address, b: 0 in ISR context, 1 in task. */
 #define RTOS_TRACE_PANIC    5u  /**< a: reason, b: arg1. */
 
-/** Provided by the application when RTOS_CFG_TRACE is on. Called with interrupts
-    disabled from inside the kernel; must be short and must not call the kernel. See
-    hal/trace.h for a ring buffer recorder. */
+/** Called with interrupts disabled from inside the kernel when RTOS_CFG_TRACE is on;
+    must be short and must not call the kernel. The weak default does nothing; the
+    application overrides it, see hal/trace.h for a ring buffer recorder. */
 void rtos_traceHook(uint8_t event, uint32_t a, uint32_t b);
 
 /* --- Called from the port layer, not by applications -------------------------------------- */

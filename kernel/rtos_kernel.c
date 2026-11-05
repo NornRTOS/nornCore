@@ -35,7 +35,9 @@
  */
 
 static void insertTimed(rtos_tcb_t *pT);
-static void removeTimed(rtos_tcb_t *pT);
+/* Out of line on purpose: inlined into makeReady it would make every wake up pay the
+   register saves of the list walk, which only a timed out or cancelled wait needs. */
+static void removeTimed(rtos_tcb_t *pT) __attribute__((noinline));
 
 
 /*
@@ -55,7 +57,8 @@ rtos_tcb_t *rtos_pNext = &rtos_tcbAry[RTOS_IDLE_TASK];
 volatile uint8_t rtos_needSwitch = 0;
 
 /** Bit n set: task n is ready to run. Bit 0 (idle) is always set. */
-static rtos_taskmask_t _readyMask = 1u;
+rtos_taskmask_t rtos_kernel_readyMask = 1u;
+#define _readyMask  rtos_kernel_readyMask
 
 /** Head of the list of tasks waiting with a timeout, sorted by wake-up tick. */
 static rtos_tcb_t *_pTimedHead = NULL;
@@ -71,52 +74,20 @@ static rtos_runtime_t _loadRefTime = 0;
 static rtos_runtime_t _loadRefIdle = 0;
 #endif
 
-/** Index of the highest set bit of a nibble; 0 for 0. */
-static const uint8_t _hiBitNibble[16] = {0,0,1,1,2,2,2,2,3,3,3,3,3,3,3,3};
+/** Index of the highest set bit of a nibble; 0 for 0. See rtos_kernel_highestBit. */
+const uint8_t rtos_kernel_hiBitNibble[16] = {0,0,1,1,2,2,2,2,3,3,3,3,3,3,3,3};
+
+#define highestBit(m)   rtos_kernel_highestBit(m)
 
 
 /*
  * Function implementation
  */
 
-/** Index of the highest set bit of a byte. Must not be called with 0. */
-static inline uint8_t highestBit8(uint8_t b)
-{
-    return (b & 0xF0u) ? (uint8_t)(4u + _hiBitNibble[b >> 4]) : _hiBitNibble[b];
-}
-
-
-/**
- * Index of the highest set bit of a task mask. Must not be called with 0 (never happens,
- * the idle bit is always set). A port with a count-leading-zeros instruction defines
- * RTOS_PORT_HIGHEST_BIT(m) and the nibble table is not used.
- */
-static inline uint8_t highestBit(rtos_taskmask_t m)
-{
-#if defined(RTOS_PORT_HIGHEST_BIT)
-    return (uint8_t)RTOS_PORT_HIGHEST_BIT(m);
-#elif RTOS_CFG_NUM_TASKS + 1 > 16
-    if(m & 0xFF000000ul)
-        return (uint8_t)(24u + highestBit8((uint8_t)(m >> 24)));
-    if(m & 0x00FF0000ul)
-        return (uint8_t)(16u + highestBit8((uint8_t)(m >> 16)));
-    if(m & 0x0000FF00ul)
-        return (uint8_t)(8u + highestBit8((uint8_t)(m >> 8)));
-    return highestBit8((uint8_t)m);
-#elif RTOS_CFG_NUM_TASKS + 1 > 8
-    if(m & 0xFF00u)
-        return (uint8_t)(8u + highestBit8((uint8_t)(m >> 8)));
-    return highestBit8((uint8_t)m);
-#else
-    return highestBit8(m);
-#endif
-}
-
-
 /**
  * Charge the time since the last switch to the current task. Interrupts disabled.
  */
-static inline void accountRunTime(void)
+RTOS_KERNEL_HOT_INLINE void accountRunTime(void)
 {
 #if RTOS_CFG_RUNTIME_STATS
     const rtos_runtime_t now = rtos_port_getRunTimeCounter();
@@ -188,9 +159,12 @@ void rtos_kernel_makeReady(rtos_tcb_t *pT)
 
 /**
  * Pick the task to run and switch to it if it is not the current one. Interrupts must be
- * disabled. Called in task context only.
+ * disabled. Called in task context only. A port that defines RTOS_PORT_INLINE_SCHEDULE
+ * gets the body inlined into blockCurrent as well, one call level and one stack frame
+ * less on every blocking call (Xtensa, where a frame is 32 bytes and a call may spill a
+ * window); on the AVR the register pressure cost more than the call it saved.
  */
-void rtos_kernel_schedule(void)
+RTOS_KERNEL_HOT_INLINE void scheduleInline(void)
 {
     rtos_tcb_t * const pCur = rtos_pCurrent;
     const uint8_t hi = highestBit(_readyMask);
@@ -212,6 +186,11 @@ void rtos_kernel_schedule(void)
     }
 }
 
+void rtos_kernel_schedule(void)
+{
+    scheduleInline();
+}
+
 
 /**
  * Block the current task until it is made ready again, with an optional timeout.
@@ -231,21 +210,17 @@ bool rtos_kernel_blockCurrent(rtos_tick_t timeout)
     }
     RTOS_TRACE(RTOS_TRACE_BLOCK, pCur->prio, pCur->waitKind);
     _readyMask &= (rtos_taskmask_t)~pCur->bit;
+#if defined(RTOS_PORT_INLINE_SCHEDULE)  &&  RTOS_PORT_INLINE_SCHEDULE
+    scheduleInline();
+#else
     rtos_kernel_schedule();
+#endif
 
     /* We are back: someone made us ready. The waiter pointer has been cleared by
        whoever did it. */
     pCur->waitKind = RTOS_WAIT_NONE;
     pCur->pWaitObj = NULL;
     return (pCur->flags & RTOS_TF_TIMED_OUT) != 0;
-}
-
-
-bool rtos_kernel_blockOn(uint8_t waitKind, const void *pWaitObj, rtos_tick_t timeout)
-{
-    rtos_pCurrent->waitKind = waitKind;
-    rtos_pCurrent->pWaitObj = pWaitObj;
-    return rtos_kernel_blockCurrent(timeout);
 }
 
 
@@ -311,40 +286,46 @@ void rtos_tickFromIsr(void)
 
 /**
  * Called by the port layer at the end of every RTOS_ISR with interrupts disabled. Switches
- * to a higher priority task if one was made ready by the ISR.
+ * to a higher priority task if one was made ready by the ISR. The body is in
+ * rtos_kernel_isrTailInline (rtos_kernel.h) for ports that want it without a call level.
  */
 void rtos_isrTail(void)
 {
-    if(rtos_needSwitch)
-    {
-        const uint8_t hi = highestBit(_readyMask);
+    rtos_kernel_isrTailInline();
+}
 
-        rtos_needSwitch = 0;
-        if(hi > rtos_pCurrent->effPrio)
-        {
-            rtos_pNext = &rtos_tcbAry[hi];
-            checkStack(rtos_pCurrent);
-            RTOS_TRACE(RTOS_TRACE_SWITCH, rtos_pCurrent->prio, hi);
-            accountRunTime();
-            rtos_port_switchContext();
-        }
-    }
+void rtos_kernel_isrPrepareSwitch(uint8_t hi)
+{
+    rtos_pNext = &rtos_tcbAry[hi];
+    checkStack(rtos_pCurrent);
+    RTOS_TRACE(RTOS_TRACE_SWITCH, rtos_pCurrent->prio, hi);
+    accountRunTime();
 }
 
 
 /**
- * First code executed in a new task's context. Reached through the return address placed
- * on the prepared stack. Interrupts are disabled on entry.
+ * Task start, in three steps so that a port whose stack frames are expensive can run them
+ * from a frameless assembly stub and give the task function the top frame of its stack
+ * (port/xtensa). Interrupts are disabled on entry to the first step.
  */
-void rtos_taskTrampoline(void)
+rtos_taskFunc_t rtos_kernel_taskStarting(void)
 {
     rtos_tcb_t * const pCur = rtos_pCurrent;
 
     pCur->periodBase = rtos_tickCount;
     rtos_port_enableInterrupts();
-    pCur->taskFunc(pCur->arg);
+    return pCur->taskFunc;
+}
 
+void *rtos_kernel_taskStartArg(void)
+{
+    return rtos_pCurrent->arg;
+}
+
+void rtos_kernel_taskExit(void)
+{
     /* The task function returned. Terminate the task: block forever. */
+    rtos_tcb_t * const pCur = rtos_pCurrent;
     (void)rtos_port_enterCritical();
     _readyMask &= (rtos_taskmask_t)~pCur->bit;
     rtos_kernel_schedule();
@@ -354,14 +335,42 @@ void rtos_taskTrampoline(void)
         ;
 }
 
+/**
+ * First code executed in a new task's context on the ports that reach it through the
+ * return address placed on the prepared stack (AVR, host).
+ */
+void rtos_taskTrampoline(void)
+{
+    const rtos_taskFunc_t f = rtos_kernel_taskStarting();
+    f(rtos_kernel_taskStartArg());
+    rtos_kernel_taskExit();
+}
+
 
 /*
  * Public API
  */
 
-void rtos_init(void)
+RTOS_PORT_WEAK void rtos_idleHook(void)
+{
+}
+
+#if RTOS_CFG_TRACE
+/** Weak default so that a kernel built with tracing (the "full" profile) links without
+    the application recording anything; hal/trace.h shows the ring buffer override. */
+RTOS_PORT_WEAK void rtos_traceHook(uint8_t event, uint32_t a, uint32_t b)
+{
+    (void)event; (void)a; (void)b;
+}
+#endif
+
+
+void rtos_initChecked(uint32_t configSignature)
 {
     uint8_t i;
+
+    if(configSignature != RTOS_CONFIG_SIGNATURE)
+        rtos_panic(RTOS_PANIC_CONFIG, configSignature, RTOS_CONFIG_SIGNATURE);
 
     for(i=0; i<RTOS_NUM_TASKS; ++i)
     {
@@ -377,12 +386,16 @@ void rtos_init(void)
         pT->periodBase = 0;
         pT->evtPending = 0;
         pT->evtWait = 0;
+#if RTOS_CFG_NOTIFY
         pT->notifyValue = 0;
+#endif
 #if RTOS_CFG_RUNTIME_STATS
         pT->runTime = 0;
 #endif
+#if RTOS_CFG_STACK_CHECK
         pT->pStackArea = NULL;
         pT->stackSize = 0;
+#endif
         pT->bit = (rtos_taskmask_t)1u << i;
         pT->prio = i;
         pT->effPrio = i;
@@ -431,10 +444,9 @@ void rtos_createTask( uint8_t prio
 
     pT->taskFunc = taskFunc;
     pT->arg = arg;
+#if RTOS_CFG_STACK_CHECK
     pT->pStackArea = stackArea;
     pT->stackSize = stackSize;
-
-#if RTOS_CFG_STACK_CHECK
     {
         size_t i;
         for(i=0; i<stackSize; ++i)
@@ -444,6 +456,34 @@ void rtos_createTask( uint8_t prio
     pT->ctx = rtos_port_initStack(stackArea, stackSize, rtos_taskTrampoline);
     _readyMask |= pT->bit;
 }
+
+
+#if RTOS_CFG_STACK_CHECK  &&  RTOS_CFG_STACK_WARN
+RTOS_PORT_WEAK void rtos_stackWarnHook(uint8_t task, size_t stackFree)
+{
+    (void)task;
+    (void)stackFree;
+}
+
+/** One task per idle loop: read its high water mark, warn once when the margin is gone. */
+static void stackMonitorIdle(void)
+{
+    static uint8_t next = 1;
+    static rtos_taskmask_t warned = 0;
+    const uint8_t task = next;
+
+    next = (uint8_t)(next + 1u >= RTOS_NUM_TASKS ? 1u : next + 1u);
+    if(rtos_tcbAry[task].taskFunc != NULL  &&  (warned & rtos_tcbAry[task].bit) == 0)
+    {
+        const size_t free = rtos_getStackFree(task);
+        if(free < RTOS_PORT_STACK_WARN)
+        {
+            warned |= rtos_tcbAry[task].bit;
+            rtos_stackWarnHook(task, free);
+        }
+    }
+}
+#endif
 
 
 void rtos_start(void)
@@ -466,9 +506,14 @@ void rtos_start(void)
     {
 #ifdef RTOS_CFG_IDLE_HOOK
         RTOS_CFG_IDLE_HOOK();
+#else
+        rtos_idleHook();
 #endif
 #if RTOS_CFG_WATCHDOG
         rtos_kernel_wdtIdle();
+#endif
+#if RTOS_CFG_STACK_CHECK  &&  RTOS_CFG_STACK_WARN
+        stackMonitorIdle();
 #endif
 #if RTOS_CFG_TICKLESS
         rtos_port_idleSleepTicks(rtos_kernel_ticksToNextWake());
@@ -631,6 +676,7 @@ uint8_t rtos_getOverrunCount(uint8_t taskId, bool reset)
     uint8_t n;
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
+    RTOS_ASSERT(taskId < RTOS_NUM_TASKS);
     n = rtos_tcbAry[taskId].cntOverrun;
     if(reset)
         rtos_tcbAry[taskId].cntOverrun = 0;
@@ -642,10 +688,13 @@ uint8_t rtos_getOverrunCount(uint8_t taskId, bool reset)
 size_t rtos_getStackFree(uint8_t taskId)
 {
 #if RTOS_CFG_STACK_CHECK
-    const rtos_tcb_t * const pT = &rtos_tcbAry[taskId];
-    const uint8_t *p = pT->pStackArea;
+    const rtos_tcb_t *pT;
+    const uint8_t *p;
     size_t n = 0;
 
+    RTOS_ASSERT(taskId < RTOS_NUM_TASKS);
+    pT = &rtos_tcbAry[taskId];
+    p = pT->pStackArea;
     if(p == NULL)
         return 0;
     while(n < pT->stackSize  &&  *p == STACK_FILL_PATTERN)
@@ -770,7 +819,11 @@ bool rtos_getTaskInfo(uint8_t taskId, rtos_taskInfo_t *pInfo)
     pInfo->pWaitObj = pInfo->state >= RTOS_TASK_BLOCKED ? pT->pWaitObj : NULL;
     pInfo->hasTimeout = (pT->flags & RTOS_TF_IN_TIMED_LIST) != 0;
     pInfo->wakeAt = pT->wakeAt;
+#if RTOS_CFG_STACK_CHECK
     pInfo->stackSize = pT->stackSize;
+#else
+    pInfo->stackSize = 0;
+#endif
     pInfo->overruns = pT->cntOverrun;
 #if RTOS_CFG_RUNTIME_STATS
     accountRunTime();
@@ -790,6 +843,7 @@ rtos_runtime_t rtos_getTaskRunTime(uint8_t taskId)
     rtos_runtime_t t;
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
+    RTOS_ASSERT(taskId < RTOS_NUM_TASKS);
     accountRunTime();
     t = rtos_tcbAry[taskId].runTime;
     rtos_port_exitCritical(cs);

@@ -6,9 +6,9 @@
 
 ifeq ($(BOARD),esp32)
   # CPU_MHZ: 40 (crystal, as the ROM leaves it) or 80, 160, 240 from the PLL
-  # (port_clock.c). The APB bus runs at 80 MHz whenever the PLL is used. 240 is
-  # experimental (see port_clock.c); 160 is the verified default.
-  CPU_MHZ ?= 160
+  # (port_clock.c). The APB bus runs at 80 MHz whenever the PLL is used. 240 is the
+  # default since 2026-11-03 (suite and nornWIF verified there); 160 and 80 work too.
+  CPU_MHZ ?= 240
   F_CPU   = $(CPU_MHZ)000000UL
   ifeq ($(CPU_MHZ),40)
     APB_HZ = 40000000UL
@@ -29,14 +29,21 @@ ESPTOOL     ?= $(ESP_PYTHON) -m esptool
 # loads the core configuration plug-in and selects the matching libgcc multilib.
 CC      = $(XTENSA_ROOT)/bin/xtensa-$(CHIP)-elf-gcc
 SIZE    = $(XTENSA_ROOT)/bin/xtensa-$(CHIP)-elf-size
+OBJCOPY = $(XTENSA_ROOT)/bin/xtensa-$(CHIP)-elf-objcopy
+AR      = $(XTENSA_ROOT)/bin/xtensa-$(CHIP)-elf-ar
 LDS     = $(BUILD)/esp32.ld
 CORE    =
+
+# Code that runs from flash (esp32.ld): the objects and archives in FLASH_OBJS are stored
+# in $(TARGET).flash.bin at FLASH_BASE and mapped through the cache before main. The
+# first 64 KB pages of the flash hold the RAM image, so FLASH_BASE leaves room for it.
+FLASH_BASE ?= 0x80000
 
 CFLAGS  = -std=c99 -pedantic -Wall -Wextra -Wshadow -Wundef -Wstrict-prototypes \
           -Os -g $(CORE) -mlongcalls -DF_CPU=$(F_CPU) -DHAL_APB_HZ=$(APB_HZ) $(INC) \
           -ffunction-sections -fdata-sections -fno-common -MMD -MP
 ASFLAGS = $(CORE) -mlongcalls -DF_CPU=$(F_CPU) -DHAL_APB_HZ=$(APB_HZ) $(INC) -x assembler-with-cpp -g -MMD -MP
-LDFLAGS = $(CORE) -nostartfiles -nostdlib -Wl,--gc-sections -Wl,-T,$(LDS) -Wl,-Map,$(TARGET).map
+LDFLAGS = $(CORE) -nostartfiles -nostdlib -Wl,--gc-sections -Wl,-T,$(LDS) -Wl,-Map,$(TARGET).map $(MOD_LDFLAGS)
 LDLIBS  = -lc -lgcc
 
 # Memory layout: the whole chip for one core, or a half per core with AMP. An
@@ -51,9 +58,21 @@ else
   MEMLD = mem_single.ld
 endif
 
-$(LDS): port/xtensa/$(MEMLD) port/xtensa/esp32.ld
+# The linker script: the memory layout, the flash windows, the section rules and the ROM
+# symbols, plus the generated lists of what the modules put in flash, IRAM and DRAM.
+# Each entry of FLASH_OBJS is a file name pattern of an object (*tc09_flash.o) or of an
+# archive (*libnet80211.a, every member); the *_SECTIONS lists name input sections.
+$(LDS): port/xtensa/$(MEMLD) port/xtensa/mem_flash.ld port/xtensa/esp32.ld port/xtensa/esp32_rom.ld $(MOD_LD) $(MAKEFILE_LIST)
 	@mkdir -p $(BUILD)
-	cat $^ > $@
+	cat port/xtensa/$(MEMLD) > $@
+	sed 's/@FLASH_BASE@/$(FLASH_BASE)/g' port/xtensa/mem_flash.ld >> $@
+	cat port/xtensa/esp32.ld port/xtensa/esp32_rom.ld $(MOD_LD) | sed "s|@LD_DIR@|$(abspath $(BUILD))|g" >> $@
+	@: > $(BUILD)/ld_flash_text.ld; for p in $(FLASH_OBJS); do case $$p in *.a) p="$$p:";; esac; echo "$$p(.literal .literal.* .text .text.*)" >> $(BUILD)/ld_flash_text.ld; done
+	@for p in $(FLASH_SECTIONS); do echo "*($$p)" >> $(BUILD)/ld_flash_text.ld; done
+	@: > $(BUILD)/ld_flash_rodata.ld; for p in $(FLASH_OBJS); do case $$p in *.a) p="$$p:";; esac; echo "$$p(.rodata .rodata.* .srodata .srodata.*)" >> $(BUILD)/ld_flash_rodata.ld; done
+	@for p in $(FLASH_RODATA_SECTIONS); do echo "*($$p)" >> $(BUILD)/ld_flash_rodata.ld; done
+	@: > $(BUILD)/ld_iram.ld; for p in $(IRAM_SECTIONS); do echo "*($$p)" >> $(BUILD)/ld_iram.ld; done
+	@: > $(BUILD)/ld_dram.ld; for p in $(DRAM_SECTIONS); do echo "*($$p)" >> $(BUILD)/ld_dram.ld; done
 
 ifdef AMP_CORE1
 CORE1_BUILD  = build/$(APP)-core1-$(BOARD)$(if $(EXTRA_CFLAGS),-extra)
@@ -75,11 +94,18 @@ $(BUILD)/amp_core1_image.o: $(BUILD)/amp_core1_image.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 endif
 
-image: $(TARGET).bin
+image: $(TARGET).bin $(TARGET).flash.bin
 	$(SIZE) $(TARGET).elf
+	@ls -l $(TARGET).flash.bin | awk '{print "flash image: " $$5 " bytes at $(FLASH_BASE)"}'
 
+# The RAM image for the ROM loader is made from the ELF without the flash sections, which
+# the loader could not place; those go to their own image by load address.
 $(TARGET).bin: $(TARGET).elf
-	$(ESPTOOL) --chip $(CHIP) elf2image -fm dio -ff 40m -fs 4MB -o $@ $<
+	$(OBJCOPY) -R .flash.rodata -R .flash.text $< $(TARGET).ram.elf
+	$(ESPTOOL) --chip $(CHIP) elf2image -fm dio -ff 40m -fs 4MB -o $@ $(TARGET).ram.elf
+
+$(TARGET).flash.bin: $(TARGET).elf
+	$(OBJCOPY) -O binary -j .flash.rodata -j .flash.text $< $@
 
 $(TARGET).elf: $(LDS)
 
@@ -87,11 +113,11 @@ $(TARGET).elf: $(LDS)
 # QEMU_ESP. Its timers drift against the CPU clock, so test builds for it take
 # EXTRA_CFLAGS=-DTC_TOLERANCE_PERMILLE=30 (tools/test_all.sh does).
 QEMU_ESP    ?= $(HOME)/dev/tools/qemu-esp
-sim: $(TARGET).bin
-	QEMU_ESP=$(QEMU_ESP) $(ESP_PYTHON) tools/qemu_run.py $< $(SIM_SECONDS)
+sim: $(TARGET).bin $(TARGET).flash.bin
+	QEMU_ESP=$(QEMU_ESP) $(ESP_PYTHON) tools/qemu_run.py $< $(or $(SIM_SECONDS),30) $(TARGET).flash.bin@$(FLASH_BASE)
 
-upload: $(TARGET).bin
-	$(ESPTOOL) --chip $(CHIP) --port $(PORT) --baud 460800 write-flash 0x1000 $<
+upload: $(TARGET).bin $(TARGET).flash.bin
+	$(ESPTOOL) --chip $(CHIP) --port $(PORT) --baud 460800 write-flash 0x1000 $< $(FLASH_BASE) $(TARGET).flash.bin
 
 monitor:
 	$(ESP_PYTHON) tools/monitor.py $(PORT) 115200

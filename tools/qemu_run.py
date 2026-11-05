@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Run an ESP32 image in Espressif's QEMU and print its serial output.
 
-Usage: qemu_run.py IMAGE.bin [SECONDS]
-Builds a 4 MB flash image with IMAGE at 0x1000 (where the ROM loader looks), starts
+Usage: qemu_run.py IMAGE.bin [SECONDS] [FILE@OFFSET ...]
+Builds a 4 MB flash image with IMAGE at 0x1000 (where the ROM loader looks) and every
+FILE at its OFFSET (the flash code image of a build that runs code from flash), starts
 qemu-system-xtensa with the serial port written to a file (stdio is not flushed through a
 pipe), follows that file, and stops when a RESULT line appears or after SECONDS (default
-30). Exit code 0 if a RESULT line was seen. QEMU_ESP points at the QEMU installation."""
+30). Exit code 0 if a RESULT line was seen. QEMU_ESP points at the QEMU installation.
+QEMU_NIC, when set, adds a network device, e.g. QEMU_NIC=user,model=open_eth."""
 import os, subprocess, sys, tempfile, time
 
 image = sys.argv[1]
@@ -19,11 +21,19 @@ with tempfile.TemporaryDirectory() as tmp:
     data = bytearray(b"\xff" * (4 * 1024 * 1024))
     img = open(image, "rb").read()
     data[0x1000:0x1000 + len(img)] = img
+    for extra in sys.argv[3:]:
+        path, offset = extra.rsplit("@", 1)
+        offset = int(offset, 0)
+        blob = open(path, "rb").read()
+        data[offset:offset + len(blob)] = blob
     open(flash, "wb").write(data)
     open(serial, "wb").close()
-    proc = subprocess.Popen([qemu, "-M", "esp32", "-display", "none", "-monitor", "none",
-                             "-serial", "file:" + serial,
-                             "-drive", "file=%s,if=mtd,format=raw" % flash],
+    args = [qemu, "-M", "esp32", "-display", "none", "-monitor", "none",
+            "-serial", "file:" + serial,
+            "-drive", "file=%s,if=mtd,format=raw" % flash]
+    if os.environ.get("QEMU_NIC"):
+        args += ["-nic", os.environ["QEMU_NIC"]]
+    proc = subprocess.Popen(args,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     seen_result = False
     pos = 0

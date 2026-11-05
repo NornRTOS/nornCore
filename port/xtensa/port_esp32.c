@@ -43,6 +43,17 @@
 #define DPORT_APPCPU_CTRL_C     PORT_REG(DR_REG_DPORT_BASE + 0x34)     /* bit 0: run stall */
 #define DPORT_APPCPU_CTRL_D     PORT_REG(DR_REG_DPORT_BASE + 0x38)     /* boot address */
 #define DPORT_CPU_INTR_FROM_CPU(n) PORT_REG(DR_REG_DPORT_BASE + 0xDC + 4ul * (n))
+/** Cache bus masks: a set bit keeps the cache from serving that window. The DPORT names
+    are the TRM's: IRAM0 is the instruction window at 0x400D0000, DROM0 the data window at
+    0x3F400000; IROM0 and DRAM1 are unmasked too, as Espressif's bootloader does. */
+#define DPORT_PRO_CACHE_CTRL1   PORT_REG(DR_REG_DPORT_BASE + 0x44)
+#define DPORT_CACHE_MASK_IRAM0  (1ul << 0)
+#define DPORT_CACHE_MASK_IROM0  (1ul << 2)
+#define DPORT_CACHE_MASK_DRAM1  (1ul << 3)
+#define DPORT_CACHE_MASK_DROM0  (1ul << 4)
+#define FLASH_DROM_WINDOW       0x3F400000ul    /* data bus window into the flash cache */
+#define FLASH_IROM_WINDOW       0x400D0000ul    /* instruction bus window */
+#define FLASH_PAGE_SIZE         0x10000ul
 #define RTC_CNTL_OPTIONS0_      PORT_REG(DR_REG_RTCCNTL_BASE + 0x00)
 #define RTC_CNTL_SW_CPU_STALL   PORT_REG(DR_REG_RTCCNTL_BASE + 0xAC)
 
@@ -61,7 +72,11 @@
 static rtos_port_isr_t _isrTable[32];
 
 /** CCOMPARE0 value of the next tick; the previous tick was one period earlier. */
-static uint32_t _nextTick;
+uint32_t rtos_port_nextTick;
+#define _nextTick   rtos_port_nextTick
+/** Cycles of all completed ticks: kept in step with the tick count by the two places
+    that count ticks, so that the run time counter is an addition, not a multiplication. */
+rtos_port_runtime_t rtos_port_runBase;
 static uint32_t _tickInterrupts;
 static uint32_t _wdtTimeoutMs;
 
@@ -94,6 +109,44 @@ DEFINE_WSR(ccompare0)
  * Function implementation
  */
 
+/* Linker symbols of esp32.ld: their addresses are the values. */
+extern uint8_t _flash_pages, _flash_lma_start, FLASH_BASE;
+
+/* ROM functions (esp32_rom.ld). The MMU has one 64 KB page table per CPU; the cache of
+   the PRO CPU must be off while the table is written. */
+extern void mmu_init(int cpuNo);
+extern unsigned int cache_flash_mmu_set_rom(int cpuNo, int pid, unsigned int vaddr, unsigned int paddr, int psize, int num);
+extern void Cache_Flush_rom(int cpuNo);
+extern void Cache_Read_Disable_rom(int cpuNo);
+extern void Cache_Read_Enable_rom(int cpuNo);
+
+
+void rtos_port_flashInit(void)
+{
+    const uint32_t pages = (uint32_t)&_flash_pages;
+    const uint32_t base = (uint32_t)&FLASH_BASE;
+
+    if(pages == 0)
+        return;
+    RTOS_ASSERT((uint32_t)&_flash_lma_start == base  &&  pages * FLASH_PAGE_SIZE <= 0x300000ul);
+    Cache_Read_Disable_rom(0);
+    Cache_Flush_rom(0);
+    mmu_init(0);
+    /* The same flash pages behind both windows: .flash.rodata is read through the first,
+       .flash.text fetched through the second, at the offsets esp32.ld gave them. */
+    (void)cache_flash_mmu_set_rom(0, 0, FLASH_DROM_WINDOW, base, 64, (int)pages);
+    (void)cache_flash_mmu_set_rom(0, 0, FLASH_IROM_WINDOW, base, 64, (int)pages);
+    DPORT_PRO_CACHE_CTRL1 &= ~(DPORT_CACHE_MASK_IRAM0 | DPORT_CACHE_MASK_IROM0 | DPORT_CACHE_MASK_DROM0 | DPORT_CACHE_MASK_DRAM1);
+    Cache_Read_Enable_rom(0);
+}
+
+
+uint32_t rtos_port_flashPages(void)
+{
+    return (uint32_t)&_flash_pages;
+}
+
+
 void rtos_port_earlyInit(void)
 {
     if(rtos_port_coreId() != 0)
@@ -112,6 +165,7 @@ void rtos_port_earlyInit(void)
     RTC_CNTL_WDTWPROTECT = 0;
 
     rtos_port_clockInit();
+    rtos_port_flashInit();
 }
 
 
@@ -179,6 +233,9 @@ void rtos_port_fatal(uint32_t cause, uint32_t epc, uint32_t vaddr)
 {
     uint8_t i;
 
+    /* A fault before main leaves the UART at the ROM's divider, wrong since the clock
+       switch: program ours so that the report is readable. */
+    uart_init(uart_currentBaud());
     uart_puts("\r\nFATAL exccause=");
     uart_putU32(cause);
     uart_puts(" epc=0x");
@@ -214,7 +271,9 @@ void rtos_port_attachInterrupt(uint8_t cpuInt, uint8_t source, rtos_port_isr_t h
 }
 
 
-void rtos_port_dispatchLevel1(void)
+/** Runs every pending level 1 handler; interrupts masked. Inline: one frame less on the
+    interrupted task's stack for the whole handler. */
+static inline __attribute__((always_inline)) void dispatchLevel1(void)
 {
     for(;;)
     {
@@ -308,9 +367,9 @@ void rtos_port_exception(uint32_t cause, uint32_t *pFrame)
     if(cause == EXCCAUSE_LEVEL1_INTERRUPT)
     {
         ++ _isrDepth;
-        rtos_port_dispatchLevel1();
+        dispatchLevel1();
         -- _isrDepth;
-        rtos_isrTail();
+        rtos_kernel_isrTailInline();        /* the switch is called from this frame */
         /* Back in the frame of whichever task resumes here. Its saved CPENABLE may say
            on, but other tasks may have used the FPU meanwhile: only the owner of the
            registers may continue without the trap. */
@@ -386,6 +445,7 @@ static void tickIsr(void)
     do
     {
         _nextTick += CYCLES_PER_TICK;
+        rtos_port_runBase += CYCLES_PER_TICK;
         wsr_ccompare0(_nextTick);
         rtos_tickFromIsr();
     }
@@ -424,9 +484,10 @@ void rtos_port_idleSleepTicks(rtos_tick_t ticks)
     {
         rtos_tickFromIsr();
         _nextTick += CYCLES_PER_TICK;
+        rtos_port_runBase += CYCLES_PER_TICK;
     }
     wsr_ccompare0(_nextTick);
-    rtos_isrTail();                     /* a caught up tick may have readied a task */
+    rtos_kernel_isrTailInline();        /* a caught up tick may have readied a task */
     rtos_port_exitCritical(cs);
 }
 
@@ -441,13 +502,6 @@ void rtos_port_startTimer(void)
 
 /* ---- time ---------------------------------------------------------------------------- */
 
-rtos_port_runtime_t rtos_port_getRunTimeCounter(void)
-{
-    /* Cycles of all completed ticks plus the cycles since the last tick boundary; the
-       pair (tick count, next tick) is updated together in tickIsr. */
-    const uint32_t sinceTick = rtos_port_ccount() - (_nextTick - CYCLES_PER_TICK);
-    return (rtos_port_runtime_t)rtos_tickCount * CYCLES_PER_TICK + sinceTick;
-}
 
 
 uint32_t rtos_getTimeUs(void)
