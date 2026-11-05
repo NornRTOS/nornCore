@@ -5,7 +5,9 @@
  * Kernel configuration of tc12 (stack under preemption at call depth, four phases).
  */
 #define RTOS_CFG_NUM_TASKS      6
-#define RTOS_CFG_TICK_HZ        1000ul
+#ifndef RTOS_CFG_TICK_HZ
+# define RTOS_CFG_TICK_HZ       1000ul
+#endif
 #define RTOS_CFG_TICK_BITS      32
 #define RTOS_CFG_EVT_BITS       16
 #define RTOS_CFG_STACK_CHECK    1

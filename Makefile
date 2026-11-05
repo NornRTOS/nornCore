@@ -25,37 +25,6 @@ ifeq ($(ARCH),)
   $(error Unknown BOARD '$(BOARD)'; known: $(patsubst ARCH_%,%,$(filter ARCH_%,$(.VARIABLES))))
 endif
 
-# ---- configuration profiles and the kernel library (the binary SDK) --------------------
-# A profile is a frozen rtos_config.h (with nn_config.h and nw_config.h for the modules)
-# under nornRTOS/profiles/<name>/, one section per board; NORN_RTOS is the nornRTOS tree
-# this checkout is a module of (modules/nornCore -> ../..). `make lib BOARD=esp32
-# PROFILE=default` builds the kernel, port and HAL from the profile into
-# build/lib-default-esp32/libnornCore.a, the unit the SDK ships. An application without
-# an rtos_config.h of its own compiles against the profile's (source build), and with
-# USE_LIB = 1 in its app.mk links the library instead of the kernel sources, exactly as
-# an SDK user does. rtos_init checks that both sides were compiled from the same
-# configuration.
-NORN_RTOS   ?= $(abspath ../..)
-PROFILE     ?= default
-PROFILE_DIR ?= $(NORN_RTOS)/profiles/$(PROFILE)
-USE_LIB     ?= 0
-APP_HAS_CONFIG = $(wildcard $(APPDIR)/rtos_config.h)
-ifneq ($(filter lib,$(MAKECMDGOALS)),)
-  APP    := lib-$(PROFILE)
-  APPDIR := $(PROFILE_DIR)
-endif
-# A module library: `make modlib MODULES=<fragment(s)> MODNAME=nornNET MODDIR=<module
-# checkout> MOD_PROFILE_DIR=<dir with the module's profile config> BOARD=.. PROFILE=..`
-# compiles the module against the kernel profile and archives its objects (only those
-# under MODDIR, so a module that needs another module's headers lists both fragments)
-# into build/lib-<profile>-<board>/lib<MODNAME>.a. The module makefiles wrap this.
-MODLIB_INC =
-ifneq ($(filter modlib,$(MAKECMDGOALS)),)
-  APP        := lib-$(PROFILE)
-  APPDIR     := $(MOD_PROFILE_DIR)
-  MODLIB_INC := -I$(PROFILE_DIR)
-endif
-
 # EXTRA_CFLAGS adds compiler flags from the command line, e.g. -DRTOS_CFG_X=1 to try a
 # configuration without editing the application; such builds get their own directory.
 BUILD    = build/$(APP)-$(BOARD)$(if $(EXTRA_CFLAGS),-extra)
@@ -67,26 +36,11 @@ PORT_ASM   = $(wildcard port/$(ARCH)/*.S)
 HAL_SRC    = $(wildcard hal/*.c) $(wildcard hal/$(ARCH)/*.c)
 APP_SRC    = $(wildcard $(APPDIR)/*.c)
 
-KERNEL_OBJ  = $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_SRC) $(PORT_SRC) $(HAL_SRC))
-KERNEL_OBJ += $(patsubst %.S,$(BUILD)/%.o,$(PORT_ASM))
-APP_OBJ     = $(patsubst $(APPDIR)/%.c,$(BUILD)/app/%.o,$(APP_SRC))
+OBJ  = $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_SRC) $(PORT_SRC) $(HAL_SRC))
+OBJ += $(patsubst %.S,$(BUILD)/%.o,$(PORT_ASM))
+OBJ += $(patsubst $(APPDIR)/%.c,$(BUILD)/app/%.o,$(APP_SRC))
 
-ifeq ($(USE_LIB),1)
-  KERNEL_LIB      = build/lib-$(PROFILE)-$(BOARD)/libnornCore.a
-  # whole-archive: the vector tables, the AVR .init3 hook and the weak defaults are not
-  # referenced by name, --gc-sections still drops what the image does not use
-  KERNEL_LIB_LINK = -Wl,--whole-archive $(KERNEL_LIB) -Wl,--no-whole-archive
-  OBJ = $(APP_OBJ)
-  INC = -I$(PROFILE_DIR) -Ikernel -Iport/$(ARCH) -Ihal -Ihal/$(ARCH) -I$(APPDIR)
-else
-  KERNEL_LIB      =
-  KERNEL_LIB_LINK =
-  OBJ = $(KERNEL_OBJ) $(APP_OBJ)
-  INC = $(MODLIB_INC) $(if $(APP_HAS_CONFIG),,-I$(PROFILE_DIR)) -Ikernel -Iport/$(ARCH) -Ihal -Ihal/$(ARCH) -I$(APPDIR)
-endif
-LIB = $(BUILD)/libnornCore.a
-MODLIB     = $(BUILD)/lib$(MODNAME).a
-MODLIB_OBJ = $(filter $(BUILD)/mod$(abspath $(MODDIR))/%,$(MOD_OBJ))
+INC = -Ikernel -Iport/$(ARCH) -Ihal -Ihal/$(ARCH) -I$(APPDIR)
 
 # ---- external modules --------------------------------------------------------------------
 # An application may pull in code from outside this repository (nornNET, for example):
@@ -112,34 +66,15 @@ FLASH_SECTIONS         += $(MOD_FLASH_SECTIONS)
 FLASH_RODATA_SECTIONS  += $(MOD_FLASH_RODATA_SECTIONS)
 DRAM_SECTIONS          += $(MOD_DRAM_SECTIONS)
 
-.PHONY: all image sim upload monitor lib modlib host-test host-cov analyze test-all clean
+.PHONY: all image sim upload monitor host-test host-cov analyze test-all clean
 
 all: image
 
 include port/$(ARCH)/arch.mk
 CFLAGS  += $(EXTRA_CFLAGS) $(MOD_CFLAGS)
 
-$(TARGET).elf: $(OBJ) $(MOD_LIBS) $(KERNEL_LIB)
-	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(KERNEL_LIB_LINK) $(MOD_LDLIBS) $(LDLIBS)
-
-lib: $(LIB)
-	@echo "$(LIB): $$(ls -l $(LIB) | awk '{print $$5}') bytes, profile $(PROFILE_DIR)"
-
-$(LIB): $(KERNEL_OBJ)
-	rm -f $@
-	$(AR) rcs $@ $(KERNEL_OBJ)
-
-ifeq ($(USE_LIB),1)
-$(KERNEL_LIB):
-	$(MAKE) --no-print-directory lib BOARD=$(BOARD) PROFILE=$(PROFILE)
-endif
-
-modlib: $(MODLIB) $(MOD_LIBS)
-	@echo "$(MODLIB): $$(ls -l $(MODLIB) | awk '{print $$5}') bytes, $(words $(MODLIB_OBJ)) objects, profile $(MOD_PROFILE_DIR)"
-
-$(MODLIB): $(MODLIB_OBJ)
-	rm -f $@
-	$(AR) rcs $@ $(MODLIB_OBJ)
+$(TARGET).elf: $(OBJ) $(MOD_LIBS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(MOD_LDLIBS) $(LDLIBS)
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)

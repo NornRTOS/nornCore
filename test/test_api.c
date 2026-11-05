@@ -48,9 +48,19 @@ static rtos_timer_t _tmr;
 static uint8_t _poolStorage[2 * 8];
 static rtos_pool_t _pool;
 static uint8_t _heapArea[256];
-static volatile unsigned _timerFired;
+static volatile unsigned _timerFired, _restarts;
+static rtos_timer_t _tmrRestart;
 
 static void timerCb(void *arg) { (void)arg; ++ _timerFired; }
+
+/** A callback that restarts its own timer with a zero delay: must run once per tick,
+    never again within the same tick (that would loop inside the tick interrupt). */
+static void restartCb(void *arg)
+{
+    (void)arg;
+    ++ _restarts;
+    rtos_timerStart(&_tmrRestart, 0, 0);
+}
 
 /* Simulated interrupts. */
 static void isrSemGive(void)      { rtos_semGiveFromIsr(&_sem); }
@@ -269,6 +279,24 @@ static void task2(void *arg)
         rtos_free(p);
         rtos_heapStats(&hs);
         CHECK(hs.frees == 1  &&  hs.free == hs.total);
+        /* Sizes near SIZE_MAX must be refused, not wrapped into a small block. */
+        CHECK(rtos_malloc(SIZE_MAX) == NULL);
+        CHECK(rtos_malloc(SIZE_MAX - 8u) == NULL);
+        CHECK(rtos_malloc(SIZE_MAX / 2u) == NULL);      /* larger than the heap, no wrap */
+        rtos_heapStats(&hs);
+        CHECK(hs.failed == 3  &&  hs.free == hs.total  &&  hs.allocs == 1);
+    }
+    /* A timer whose callback restarts it with delay 0 fires once per tick and the
+       tick interrupt always terminates. */
+    rtos_timerInit(&_tmrRestart, restartCb, NULL);
+    rtos_timerStart(&_tmrRestart, 1, 0);
+    rtos_delay(5);
+    rtos_timerStop(&_tmrRestart);
+    CHECK(_restarts >= 4  &&  _restarts <= 6);
+    {
+        const unsigned n = _restarts;
+        rtos_delay(3);
+        CHECK(_restarts == n);
     }
 
     /* --- periodic wait: the base is the task start, so a first call after a long start

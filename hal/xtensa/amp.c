@@ -45,7 +45,7 @@ static void crossCoreIsr(void)
 
 void amp_init(void)
 {
-    RTOS_ASSERT((uintptr_t)_shared_size >= sizeof(amp_shared_t));
+    RTOS_CHECK((uintptr_t)_shared_size >= sizeof(amp_shared_t), (uintptr_t)_shared_size, sizeof(amp_shared_t));
     _pShared = (amp_shared_t *)_shared_start;
     if(rtos_port_coreId() == 0)
     {
@@ -55,7 +55,7 @@ void amp_init(void)
         _pRx = &_pShared->toCore0;
         _pTx = &_pShared->toCore1;
         rtos_port_attachInterrupt(CPU_INT_CROSS, RTOS_PORT_SRC_FROM_CPU0, crossCoreIsr);
-        RTOS_ASSERT(amp_core1_image != NULL  &&  &amp_core1_image_size != NULL);
+        RTOS_CHECK(amp_core1_image != NULL  &&  &amp_core1_image_size != NULL, (uintptr_t)amp_core1_image, 0);
         rtos_port_startAppCpu(amp_core1_image, amp_core1_image_size);
     }
     else
@@ -70,14 +70,23 @@ void amp_init(void)
 
 bool amp_send(const amp_msg_t *pMsg)
 {
+    /* The ring is single producer, single consumer between the cores: this core writes
+       tail, the other reads it, so no lock is needed across the cores. Between tasks of
+       this core the read-modify-write of tail is a critical section, so that two tasks
+       calling amp_send at once never take the same slot. */
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
     const uint16_t tail = _pTx->tail;
     const uint16_t next = (uint16_t)((tail + 1u) % AMP_RING_SLOTS);
 
     if(next == _pTx->head)
+    {
+        rtos_port_exitCritical(cs);
         return false;
+    }
     _pTx->slot[tail] = *pMsg;
     barrier();
     _pTx->tail = next;
+    rtos_port_exitCritical(cs);
     rtos_port_signalOtherCore();
     return true;
 }
@@ -89,8 +98,15 @@ uint16_t amp_pending(void)
 
 bool amp_receive(amp_msg_t *pMsg, rtos_tick_t timeout)
 {
+    /* The timeout covers the whole call: every wake-up that finds the ring empty (the
+       other core's interrupt arrived for a message already taken) waits only for what
+       is left of it. The read-modify-write of head is a critical section against other
+       tasks of this core, as in amp_send. */
+    const rtos_tick_t t0 = rtos_getTick();
     for(;;)
     {
+        rtos_tick_t left = timeout;
+        const rtos_port_cs_t cs = rtos_port_enterCritical();
         const uint16_t head = _pRx->head;
         if(head != _pRx->tail)
         {
@@ -98,9 +114,18 @@ bool amp_receive(amp_msg_t *pMsg, rtos_tick_t timeout)
             *pMsg = _pRx->slot[head];
             barrier();
             _pRx->head = (uint16_t)((head + 1u) % AMP_RING_SLOTS);
+            rtos_port_exitCritical(cs);
             return true;
         }
-        if(!rtos_semTake(&_semRx, timeout))
+        rtos_port_exitCritical(cs);
+        if(timeout != RTOS_FOREVER)
+        {
+            const rtos_tick_t spent = (rtos_tick_t)(rtos_getTick() - t0);
+            if(spent >= timeout)
+                return false;
+            left = timeout - spent;
+        }
+        if(!rtos_semTake(&_semRx, left))
             return false;
     }
 }

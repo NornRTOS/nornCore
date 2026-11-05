@@ -218,6 +218,11 @@ typedef enum rtos_panicReason
     RTOS_PANIC_CONFIG,          /**< rtos_init: the application was compiled against another
                                      configuration than the kernel; arg1: the application's
                                      signature, arg2: the kernel's (RTOS_CONFIG_SIGNATURE). */
+    RTOS_PANIC_ARGUMENT,        /**< A mandatory check refused an argument or an input that
+                                     would corrupt memory (RTOS_CHECK in rtos_assert.h, compiled
+                                     in every configuration): a task id out of range, a stack
+                                     too small, a NULL storage or callback, a foreign block
+                                     freed; arg1 and arg2 name the values. */
     RTOS_PANIC_APPLICATION      /**< rtos_panic called by the application; args are its own. */
 } rtos_panicReason_t;
 
@@ -312,7 +317,7 @@ typedef struct rtos_taskInfo
 
 /** Reset all kernel data. Call once before creating tasks. The macro passes the
     configuration signature of the application's rtos_config.h; a kernel built from
-    another configuration (a library of another profile) panics with RTOS_PANIC_CONFIG. */
+    another configuration (stale objects, a library) panics with RTOS_PANIC_CONFIG. */
 void rtos_initChecked(uint32_t configSignature);
 #define rtos_init()     rtos_initChecked(RTOS_CONFIG_SIGNATURE)
 
@@ -463,9 +468,10 @@ bool rtos_notifyTake(rtos_tick_t timeout);
     not be NULL. Not for a timer that is active. */
 void rtos_timerInit(rtos_timer_t *pT, rtos_timerFunc_t callback, void *arg);
 
-/** Arm the timer to fire after \a delay ticks (delay..delay+1, as rtos_delay) and then
-    every \a period ticks exactly (0 for one shot). Restarts a running timer. Usable from
-    tasks and from ISR bodies. */
+/** Arm the timer to fire after \a delay ticks (delay..delay+1, as rtos_delay; 0 means
+    the next tick, never the current one, so a callback may restart its timer with 0) and
+    then every \a period ticks exactly (0 for one shot). Restarts a running timer. Usable
+    from tasks, ISR bodies and timer callbacks. */
 void rtos_timerStart(rtos_timer_t *pT, rtos_tick_t delay, rtos_tick_t period);
 
 /** Disarm the timer; nothing happens if it is not active. Usable from ISR bodies. */

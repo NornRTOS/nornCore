@@ -72,7 +72,7 @@ void rtos_heapInit(void *area, size_t size)
     uint8_t *p = (uint8_t *)ALIGN_UP((uintptr_t)area);
     size_t n;
 
-    RTOS_ASSERT(area != NULL  &&  size > 4u * MIN_BLOCK);
+    RTOS_CHECK(area != NULL  &&  size > 4u * MIN_BLOCK, (uintptr_t)area, size);
     n = (size - (size_t)(p - (uint8_t *)area)) & ~(HEAP_ALIGN - 1u);
     _start = p;
     _end = p + n;
@@ -88,13 +88,26 @@ void rtos_heapInit(void *area, size_t size)
 
 void *rtos_malloc(size_t size)
 {
-    const size_t need = ALIGN_UP(size + OVERHEAD) < MIN_BLOCK ? MIN_BLOCK : ALIGN_UP(size + OVERHEAD);
+    size_t need;
     freeBlock_t *pL;
     uint8_t *pB = NULL;
     void *result = NULL;
-    const rtos_port_cs_t cs = rtos_port_enterCritical();
+    rtos_port_cs_t cs;
 
-    RTOS_ASSERT(_start != NULL);
+    /* A size near SIZE_MAX would wrap in size + OVERHEAD and the alignment round-up and
+       come out small: refuse it (and count it as a failed allocation). */
+    if(size > (size_t)(SIZE_MAX - OVERHEAD - (HEAP_ALIGN - 1u)))
+    {
+        cs = rtos_port_enterCritical();
+        if(_stats.failed < 0xFFFFu)
+            ++ _stats.failed;
+        rtos_port_exitCritical(cs);
+        return NULL;
+    }
+    need = ALIGN_UP(size + OVERHEAD) < MIN_BLOCK ? MIN_BLOCK : ALIGN_UP(size + OVERHEAD);
+    cs = rtos_port_enterCritical();
+
+    RTOS_CHECK(_start != NULL, size, 0);                /* rtos_heapInit first */
     for(pL=_pFree; pL!=NULL; pL=pL->pNext)
     {
         if(blockSize(BLOCK(pL)) >= need)
@@ -140,7 +153,7 @@ void rtos_free(void *p)
         return;
     pB = (uint8_t *)p - HDR;
     cs = rtos_port_enterCritical();
-    RTOS_ASSERT(pB >= _start  &&  pB < _end  &&  blockUsed(pB));
+    RTOS_CHECK(pB >= _start  &&  pB < _end  &&  blockUsed(pB), (uintptr_t)p, 0);   /* not ours, or freed twice */
     size = blockSize(pB);
     _stats.free += size;
     if(_stats.frees < 0xFFFFu)

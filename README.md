@@ -94,38 +94,44 @@ embedded in the core 0 image, which copies it into place and starts the APP CPU 
 the shared window, 16 byte messages, the receiver woken by the other core's FROM_CPU
 interrupt. tc07 shows it: 200 requests per second answered by core 1, 10 us round trip.
 
-## Configuration profiles and the kernel library
+## Three configurations to start from
 
-An application normally carries its own rtos_config.h and compiles the kernel with it.
-For the binary SDK the configuration is frozen into profiles instead: one rtos_config.h
-per board and profile under config/profiles/<board>/<name>/ (esp32, mega2560 and uno,
-each with `default` and `small`; esp32 also `full`: 31 tasks, tracing, tickless idle),
-and the kernel, port and HAL are built from it into a library:
+config/rtos_config.template.h documents every option. These three sets are starting
+points to copy into an application's rtos_config.h, measured with tc10 on the boards
+(cycles per context switch: ESP32 at 240 MHz / Mega at 16 MHz):
 
-    make lib BOARD=esp32 PROFILE=default      build/lib-default-esp32/libnornCore.a
-    make APP=sdk01 BOARD=esp32                an application built the SDK way: app.mk says
-                                              PROFILE = default and USE_LIB = 1, it has no
-                                              rtos_config.h, compiles against the profile's
-                                              and links the library (built on demand)
+    option                   small              default             large
+    NUM_TASKS esp32/mega/uno 7 / 4 / 3          15 / 7 / 4          31 / 7 / -
+    TICK_BITS esp32/avr      32 / 16            32 / 32 (uno 16)    32 / 32
+    EVT_BITS esp32/avr       16 / 8             32 / 16 (uno 8)     32 / 16
+    STACK_CHECK              1                  2 (canary)          2
+    STACK_WARN               0                  1                   1
+    RUNTIME_STATS            0                  1                   1
+    ASSERT                   0                  1                   1
+    EVGROUPS, SUSPEND        0                  1 (uno 0)           1
+    HEAP, WATCHDOG           0                  esp32 1, avr 0      esp32 1, avr 0
+    TRACE                    0                  0                   1
+    TICKLESS (esp32)         0                  0                   1
+    SW_TIMERS, NOTIFY        1 (uno: timers 0)  1                   1
+    switch, esp32 / mega     347 / 315          440 / 472           472 / -
+    meant for                the lean kernel    an ordinary app,    development and
+                                                nornWIFI needs it   diagnosis; not the UNO
 
-What a profile fixes: the number of tasks (and with it the width of the task masks in
-every object), tick and event widths, every optional feature, the tick rate and the
-board's clock and timer. What the application still decides: its tasks, their stacks and
-priorities up to RTOS_PRIO_APP_MAX, the hooks. The hooks of a binary kernel are functions,
-not macros: rtos_idleHook (replaces RTOS_CFG_IDLE_HOOK, which only a source build can
-use), rtos_stackWarnHook, rtos_panicHook, rtos_assertFailed, all weak with a default.
+Common to all: TICK_HZ 1000, IDLE_SLEEP 1, TIMER_TASK_PRIO 0, PANIC_ACTION 0 (halt).
+nornWIFI needs the heap, event groups and 32 event bits (default or large on the ESP32);
+the original Mega bootloader does not survive a watchdog reset, hence no watchdog on
+the AVR. A suggested priority map puts the module tasks at the top: with 15 tasks the
+nornWIFI radio at 15, its service task at 14, the nornNET net task at 13, the
+application from 1 to 12.
 
-Each profile ends with a priority map: the tasks of the nornOS modules sit at the top
-(RTOS_PRIO_WIFI_RADIO 15, RTOS_PRIO_WIFI_SERVICE 14, RTOS_PRIO_NET 13 in esp32/default)
-and the application uses 1..RTOS_PRIO_APP_MAX; nornNET and nornWIFI read these names
-when their own configuration does not set a priority.
+The hooks an application may define are functions with weak defaults: rtos_idleHook
+(RTOS_CFG_IDLE_HOOK as a macro still works), rtos_stackWarnHook, rtos_panicHook,
+rtos_assertFailed, rtos_traceHook.
 
 rtos_init passes RTOS_CONFIG_SIGNATURE, every layout changing option folded into one
-number, to the kernel; a library built from another profile than the one the
-application compiled against panics at once with RTOS_PANIC_CONFIG (both signatures in
-the record) instead of corrupting memory. The library is linked whole (--whole-archive)
-so that the vector tables and the weak defaults are present; --gc-sections still drops
-what the image does not use.
+number, to the kernel; an application compiled against another rtos_config.h than the
+kernel objects it is linked with (a stale build directory, a library) panics at once
+with RTOS_PANIC_CONFIG instead of corrupting memory.
 
 ## Model
 
@@ -206,6 +212,19 @@ What the kernel does when things go wrong, all optional per configuration:
     trace              RTOS_CFG_TRACE: rtos_traceHook at switches, blocks, wake-ups, timer
                        callbacks and panics; hal/trace.c keeps a ring buffer with time
                        stamps that rtos_panicHook can dump.
+    mandatory checks   RTOS_CHECK (rtos_assert.h) is compiled in every configuration,
+                       unlike RTOS_ASSERT: a task id used as an array index, a stack
+                       smaller than the port's frames, a NULL storage or callback, a
+                       block freed that is not the pool's or the heap's, a heap used
+                       before its init, the memory layout the ESP32 port relies on. A
+                       failure is RTOS_PANIC_ARGUMENT with the values. Assertions
+                       remain for contracts and internal invariants (a mutex unlocked
+                       by a non owner, a wait list invariant) and may be switched off.
+    input checks       rtos_malloc refuses a size that would wrap (NULL, counted as
+                       failed); a software timer started with delay 0 fires at the next
+                       tick, never again in the tick it was started from; the ESP32
+                       port validates the APP CPU's image (every segment inside the
+                       image, word aligned, inside that CPU's memory) before copying.
 
 AVR note: a watchdog reset is only survivable with a bootloader that disables the watchdog
 at start. The original Mega 2560 bootloader does not, and the board then resets in a loop
@@ -356,8 +375,13 @@ trampoline frame under every task cannot go without breaking the window spill ch
 
 The ESP32 figures are from the board after the hot path work (2026-11-04 evening, the
 switch was 456 cycles before it); the entry minimum reads 0 because the probe timer's
-40 MHz counter is latched at the alarm. doc/esp32_hotpath.md has the static review that
-preceded the measurement.
+40 MHz counter is latched at the alarm. With the run time statistics off the switch is
+361 cycles, with assertions off as well 351 (1.46 us). The interrupt entry costs the
+same 850 ns whether the interrupted task is 0 or 32 call frames deep (tc12): the spill
+at entry is not depth dependent beyond the register file: the entry spills the live
+windows, at most about seven (126 cycles), which only the first interrupt after a deep
+descent pays in full. The worst entry seen is about 1.8 us, that spill behind a tick
+handler. doc/esp32_hotpath.md has the static review and the measurements.
 
 Where the cycles go on the AVR, per switch: ~105 in port_context.S (19 registers each
 way), ~45 in the run time statistics (RTOS_CFG_RUNTIME_STATS 0 saves them), ~20 in
@@ -395,9 +419,6 @@ nothing, and a heavy parallel build on the host can even fail their latency limi
     tc12   the same on top of a call chain 0..32 frames deep, in four phases: the chain
            alone, preempted at the bottom, blocking at the bottom, floating point at the
            bottom (Mega and ESP32)
-    sdk01  built like an SDK application: no rtos_config.h, the default profile's
-           library, the hooks as functions; checks the signature, the hooks and the
-           primitives (every board)
            (tc01..tc04 use the application timer of hal/<arch>/board.h and run on every board)
     tc02   queue fed from an ISR with deliberate overflow, mailbox between tasks
     tc03   task notifications from ISR and timers, one shot and periodic software timers

@@ -52,7 +52,7 @@ static inline void notifyInner(rtos_tcb_t *pT, uint16_t value, uint8_t op)
 
 void rtos_notifyFromIsr(uint8_t taskId, uint16_t value, uint8_t op)
 {
-    RTOS_ASSERT(taskId >= 1  &&  taskId < RTOS_NUM_TASKS);
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
     notifyInner(&rtos_tcbAry[taskId], value, op);
 }
 

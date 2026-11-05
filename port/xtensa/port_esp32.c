@@ -128,7 +128,7 @@ void rtos_port_flashInit(void)
 
     if(pages == 0)
         return;
-    RTOS_ASSERT((uint32_t)&_flash_lma_start == base  &&  pages * FLASH_PAGE_SIZE <= 0x300000ul);
+    RTOS_CHECK((uint32_t)&_flash_lma_start == base  &&  pages * FLASH_PAGE_SIZE <= 0x300000ul, base, pages);
     Cache_Read_Disable_rom(0);
     Cache_Flush_rom(0);
     mmu_init(0);
@@ -255,8 +255,8 @@ void rtos_port_attachInterrupt(uint8_t cpuInt, uint8_t source, rtos_port_isr_t h
 {
     rtos_port_cs_t cs;
 
-    RTOS_ASSERT(cpuInt < 32  &&  (PORT_LEVEL1_INT_MASK & (1ul << cpuInt)) != 0
-                &&  handler != NULL);
+    RTOS_CHECK(cpuInt < 32  &&  (PORT_LEVEL1_INT_MASK & (1ul << cpuInt)) != 0
+                &&  handler != NULL, cpuInt, source);
     cs = rtos_port_enterCritical();
     _isrTable[cpuInt] = handler;
     if(source != RTOS_PORT_SRC_NONE)
@@ -385,18 +385,54 @@ void rtos_port_exception(uint32_t cause, uint32_t *pFrame)
 
 /* ---- AMP ----------------------------------------------------------------------------- */
 
+/* The memory the APP CPU's image may be loaded into: its halves of IRAM and DRAM
+   (port/xtensa/mem_core1.ld). Anything else in a segment header is a corrupt image. */
+#define CORE1_IRAM_START    0x40090000ul
+#define CORE1_IRAM_END      0x400A0000ul
+#define CORE1_DRAM_START    0x3FFC8000ul
+#define CORE1_DRAM_END      0x3FFDC000ul
+
+static bool core1Window(uint32_t addr, uint32_t len)
+{
+    return (addr >= CORE1_IRAM_START  &&  len <= CORE1_IRAM_END - addr)
+           ||  (addr >= CORE1_DRAM_START  &&  len <= CORE1_DRAM_END - addr);
+}
+
 void rtos_port_startAppCpu(const uint8_t *image, uint32_t size)
 {
     /* esptool image: 8 byte header (magic 0xE9, segment count, flash mode, flash size and
        speed, entry) plus 16 bytes of extended header, then segments of (load address,
-       length, data). IRAM only takes 32 bit accesses, so the copy is word by word. */
-    const uint32_t entry = *(const uint32_t *)(image + 4);
-    const uint8_t segments = image[1];
-    uint32_t off = 24;
-    uint8_t i;
+       length, data). IRAM only takes 32 bit accesses, so the copy is word by word. The
+       image is trusted for nothing: every segment must lie inside the image, be a whole
+       number of words, and land inside the APP CPU's memory, or the start is refused
+       (rtos_port_fatal, cause 0x2000 + the segment number, with the offending address
+       and length), before anything is written. */
+    uint32_t entry, off = 24;
+    uint8_t segments, i;
 
-    RTOS_ASSERT(image[0] == 0xE9  &&  size > 24);
-    for(i=0; i<segments  &&  off + 8 <= size; ++i)
+    if(image == NULL  ||  size < 24u  ||  image[0] != 0xE9)
+        rtos_port_fatal(0x2000ul, 0, size);
+    entry = *(const uint32_t *)(image + 4);
+    segments = image[1];
+    if(entry < CORE1_IRAM_START  ||  entry >= CORE1_IRAM_END)
+        rtos_port_fatal(0x2000ul, entry, 0);
+
+    /* Pass 1: check every segment header against the image and the memory windows. */
+    for(i=0; i<segments; ++i)
+    {
+        uint32_t addr, len;
+        if(off > size - 8u)
+            rtos_port_fatal(0x2001ul + i, off, size);
+        addr = *(const uint32_t *)(image + off);
+        len = *(const uint32_t *)(image + off + 4);
+        if((len & 3u) != 0  ||  (addr & 3u) != 0  ||  len > size - off - 8u  ||  !core1Window(addr, len))
+            rtos_port_fatal(0x2001ul + i, addr, len);
+        off += 8u + len;
+    }
+
+    /* Pass 2: copy. */
+    off = 24;
+    for(i=0; i<segments; ++i)
     {
         const uint32_t addr = *(const uint32_t *)(image + off);
         const uint32_t len = *(const uint32_t *)(image + off + 4);
@@ -407,7 +443,7 @@ void rtos_port_startAppCpu(const uint8_t *image, uint32_t size)
         for(k=0; k<len; k+=4)
             dst[k / 4] = (uint32_t)src[k] | ((uint32_t)src[k + 1] << 8)
                          | ((uint32_t)src[k + 2] << 16) | ((uint32_t)src[k + 3] << 24);
-        off += 8 + len;
+        off += 8u + len;
     }
 
     /* Release the APP CPU: no stall, clock on, reset pulse, boot address. */

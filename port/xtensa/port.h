@@ -226,7 +226,9 @@ uint32_t rtos_port_fpuSwitchCount(void);
 
 /** AMP: copy the APP CPU's image (an esptool image: header and segments for its own
     IRAM/DRAM, see mem_core1.ld) into place and start the APP CPU at its entry. Called on
-    the PRO CPU before the kernel starts. */
+    the PRO CPU before the kernel starts. The image is validated before anything is
+    written: magic, entry and every segment (inside the image, word aligned, inside the
+    APP CPU's memory); a bad image ends in rtos_port_fatal with cause 0x2000 + segment. */
 void rtos_port_startAppCpu(const uint8_t *image, uint32_t size);
 
 /** Raise the FROM_CPU interrupt of the other core (source 24 for the PRO CPU, 25 for the

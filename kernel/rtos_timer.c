@@ -185,7 +185,7 @@ rtos_tick_t rtos_kernel_timerTicksToNext(void)
 
 void rtos_timerInit(rtos_timer_t *pT, rtos_timerFunc_t callback, void *arg)
 {
-    RTOS_ASSERT(callback != NULL);
+    RTOS_CHECK(callback != NULL, (uintptr_t)pT, 0);
     pT->pNext = NULL;
     pT->expiresAt = 0;
     pT->period = 0;
@@ -201,11 +201,14 @@ void rtos_timerStart(rtos_timer_t *pT, rtos_tick_t delay, rtos_tick_t period)
 {
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
-    RTOS_ASSERT(pT->callback != NULL);
+    RTOS_CHECK(pT->callback != NULL, (uintptr_t)pT, 0);  /* rtos_timerInit first */
     if(pT->active)
         remove(pT);
     pT->period = period;
-    pT->expiresAt = rtos_tickCount + delay;
+    /* A delay of 0 means the next tick, never this one: a callback that restarts its
+       timer with 0 from inside the tick would otherwise be found due again by the same
+       rtos_kernel_timerTick loop and run forever inside the interrupt. */
+    pT->expiresAt = (rtos_tick_t)(rtos_tickCount + (delay == 0 ? (rtos_tick_t)1 : delay));
     insert(pT);
     rtos_port_exitCritical(cs);
 }

@@ -88,6 +88,58 @@ windows earlier), one interrupted while running 336 as in QEMU; the kernel and p
 share at depth 0..32 is 416 / 240 / 416 bytes for preempted / blocking / preempted with
 float, identical to QEMU.
 
-Still to run: the RUNTIME_STATS=0 and ASSERT=0 variants (item 3's share), and the entry
-latency against the interrupted task's depth (item 1's share). Lesson from the run: QEMU
-timing tests fail spuriously when a heavy build runs on the host at the same time.
+The variants, 2026-11-05, same board (cycles per switch / ISR to task):
+
+    default                               405 / 417
+    RTOS_CFG_RUNTIME_STATS 0              361 / 365     the statistics cost 44 cycles
+    RTOS_CFG_ASSERT 0                     394 / 399     the assertions cost 11
+    both off                              351 / 351     1.46 us per switch
+
+Item 3's remaining share is therefore 44 cycles: the 64 bit `runTime += now - last` and
+the three loads of the inline counter; the multiplication is gone. Item 4 (assertions)
+is 11 cycles, not worth touching.
+
+Item 1, the spill at interrupt entry against the depth of the interrupted chain (tc12
+phases B and D, the probe's own entry latency per depth 0, 4, 8, 16, 32):
+
+    depth            0      4      8      16     32
+    entry avg (ns)   850    850    850    850    850
+    entry max (ns)   850    950    1375   950    850
+
+Flat: 850 ns = 204 cycles at every depth, with rare 1300-1375 ns maxima (under 2 % of
+the probes, +110 to +126 cycles, discrete). Chased down on 2026-11-05 with three
+instruments in tc12: the cycles since the last tick boundary per spike, the probe's
+index within its cell, and a spin loop without calls. The spikes are not the tick (with
+the tick at 100 Hz they sat mid period) and not the depth as such: every one of them
+is probe #0 of its cell, the first interrupt after the chain was descended. At that
+moment the register file holds the chain's lowest windows, about seven call8 frames,
+and SPILL_ALL at entry spills them all, about 18 cycles each; after the switch out and
+back only the bottom window is live and every later probe pays for one. With a call in
+the spin loop (rtos_getTick) the same thing happened mid cell: each call8/retw pair
+refilled windows, and a probe landing on a freshly refilled file paid the spill again.
+
+So the entry's spill cost is the number of live windows times about 18 cycles, bounded
+by the register file (about 126 cycles), independent of how deep the chain is beyond
+the file, and most of the time one or two windows. The worst interrupt entry on the
+ESP32 is therefore 204 + 126 + a tick handler in front (about 100): 430 cycles, 1.8 us.
+Phase D adds a window of the same size now and then: the lazy FPU trap that re-enables
+the coprocessor after a switch back. A lazy spill at entry would save up to those 126
+cycles for interrupts that do not switch, at the price of the handler running on the
+interrupted task's live windows; not worth the risk for now.
+
+tc12 now spins on CCOUNT by default on the ESP32 (TC12_SPIN_CALLS brings the call back)
+and fails if the per depth entry averages differ by more than 10 % or any entry exceeds
+1.4 us, so a future change that makes the entry depth dependent is caught by the
+suite. The chain's older windows are spilled by the
+hardware on the way down (the register file holds four to seven call8 frames), so at
+the interrupt only those few are live whatever the depth, and SPILL_ALL at entry costs
+the same handful of overflow exceptions every time. A lazy spill (only when the handler
+switches) could save at most that handful, perhaps 50 to 80 cycles per interrupt that
+does not switch, at the price of the handler running on live windows of the interrupted
+task; not worth the risk for now. The 204 cycles are the fixed frame (49 stores, 3
+rsync), the few spills and the dispatch: the hypothesis that the spill dominates and
+grows with depth is refuted. On the Mega the application timer counts at 125 kHz, too
+coarse for this measurement (tc12 prints 0 there).
+
+Lesson from the runs: QEMU timing tests fail spuriously when a heavy build runs on the
+host at the same time, or right after a clean build.

@@ -200,7 +200,7 @@ bool rtos_kernel_blockCurrent(rtos_tick_t timeout)
 {
     rtos_tcb_t * const pCur = rtos_pCurrent;
 
-    RTOS_ASSERT(pCur != &rtos_tcbAry[RTOS_IDLE_TASK]);
+    RTOS_CHECK(pCur != &rtos_tcbAry[RTOS_IDLE_TASK], RTOS_IDLE_TASK, 0);   /* idle must stay ready */
 
     pCur->flags &= (uint8_t)~RTOS_TF_TIMED_OUT;
     if(timeout != RTOS_FOREVER)
@@ -356,8 +356,8 @@ RTOS_PORT_WEAK void rtos_idleHook(void)
 }
 
 #if RTOS_CFG_TRACE
-/** Weak default so that a kernel built with tracing (the "full" profile) links without
-    the application recording anything; hal/trace.h shows the ring buffer override. */
+/** Weak default so that a kernel built with tracing links without the application
+    recording anything; hal/trace.h shows the ring buffer override. */
 RTOS_PORT_WEAK void rtos_traceHook(uint8_t event, uint32_t a, uint32_t b)
 {
     (void)event; (void)a; (void)b;
@@ -423,10 +423,10 @@ void rtos_createTask( uint8_t prio
 {
     rtos_tcb_t *pT;
 
-    RTOS_ASSERT(prio >= 1  &&  prio < RTOS_NUM_TASKS);
-    RTOS_ASSERT(taskFunc != NULL  &&  stackArea != NULL);
+    RTOS_CHECK(prio >= 1  &&  prio < RTOS_NUM_TASKS, prio, RTOS_NUM_TASKS);
+    RTOS_CHECK(taskFunc != NULL  &&  stackArea != NULL, (uintptr_t)taskFunc, (uintptr_t)stackArea);
     pT = &rtos_tcbAry[prio];
-    RTOS_ASSERT(pT->taskFunc == NULL);
+    RTOS_CHECK(pT->taskFunc == NULL, prio, 0);          /* the slot is in use */
 
     /* Trim the area to the alignment the port's ABI requires for stack frames. */
     {
@@ -434,13 +434,13 @@ void rtos_createTask( uint8_t prio
         if(misalign != 0)
         {
             const size_t skip = RTOS_PORT_STACK_ALIGN - misalign;
-            RTOS_ASSERT(stackSize > skip);
+            RTOS_CHECK(stackSize > skip, stackSize, skip);
             stackArea += skip;
             stackSize -= skip;
         }
         stackSize -= stackSize % RTOS_PORT_STACK_ALIGN;
     }
-    RTOS_ASSERT(stackSize >= RTOS_PORT_MIN_STACK);
+    RTOS_CHECK(stackSize >= RTOS_PORT_MIN_STACK, stackSize, RTOS_PORT_MIN_STACK);
 
     pT->taskFunc = taskFunc;
     pT->arg = arg;
@@ -638,7 +638,7 @@ void rtos_postEvents(uint8_t taskId, rtos_evt_t events)
 {
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
-    RTOS_ASSERT(taskId >= 1  &&  taskId < RTOS_NUM_TASKS);
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
     postEventsInner(&rtos_tcbAry[taskId], events);
     rtos_kernel_schedule();
     rtos_port_exitCritical(cs);
@@ -647,7 +647,7 @@ void rtos_postEvents(uint8_t taskId, rtos_evt_t events)
 
 void rtos_postEventsFromIsr(uint8_t taskId, rtos_evt_t events)
 {
-    RTOS_ASSERT(taskId >= 1  &&  taskId < RTOS_NUM_TASKS);
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
     postEventsInner(&rtos_tcbAry[taskId], events);
 }
 
@@ -676,7 +676,7 @@ uint8_t rtos_getOverrunCount(uint8_t taskId, bool reset)
     uint8_t n;
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
-    RTOS_ASSERT(taskId < RTOS_NUM_TASKS);
+    RTOS_CHECK(taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
     n = rtos_tcbAry[taskId].cntOverrun;
     if(reset)
         rtos_tcbAry[taskId].cntOverrun = 0;
@@ -692,7 +692,7 @@ size_t rtos_getStackFree(uint8_t taskId)
     const uint8_t *p;
     size_t n = 0;
 
-    RTOS_ASSERT(taskId < RTOS_NUM_TASKS);
+    RTOS_CHECK(taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
     pT = &rtos_tcbAry[taskId];
     p = pT->pStackArea;
     if(p == NULL)
@@ -716,7 +716,7 @@ void rtos_suspend(uint8_t taskId)
     rtos_tcb_t *pT;
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
-    RTOS_ASSERT(taskId >= 1  &&  taskId < RTOS_NUM_TASKS);
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
     pT = &rtos_tcbAry[taskId];
     if((pT->flags & RTOS_TF_SUSPENDED) == 0)
     {
@@ -739,7 +739,7 @@ void rtos_resume(uint8_t taskId)
     rtos_tcb_t *pT;
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
-    RTOS_ASSERT(taskId >= 1  &&  taskId < RTOS_NUM_TASKS);
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
     pT = &rtos_tcbAry[taskId];
     if(pT->flags & RTOS_TF_SUSPENDED)
     {
@@ -760,7 +760,7 @@ void rtos_resumeFromIsr(uint8_t taskId)
 {
     rtos_tcb_t * const pT = &rtos_tcbAry[taskId];
 
-    RTOS_ASSERT(taskId >= 1  &&  taskId < RTOS_NUM_TASKS);
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
     if((pT->flags & RTOS_TF_SUSPENDED) != 0)
     {
         pT->flags &= (uint8_t)~RTOS_TF_SUSPENDED;
@@ -843,7 +843,7 @@ rtos_runtime_t rtos_getTaskRunTime(uint8_t taskId)
     rtos_runtime_t t;
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
-    RTOS_ASSERT(taskId < RTOS_NUM_TASKS);
+    RTOS_CHECK(taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
     accountRunTime();
     t = rtos_tcbAry[taskId].runTime;
     rtos_port_exitCritical(cs);

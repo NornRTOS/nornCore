@@ -85,7 +85,7 @@ static bool dequeue(rtos_queue_t *pQ, void *pItem)
 
 void rtos_queueInit(rtos_queue_t *pQ, uint8_t *storage, uint8_t itemSize, uint8_t capacity)
 {
-    RTOS_ASSERT(storage != NULL  &&  itemSize > 0  &&  capacity > 0);
+    RTOS_CHECK(storage != NULL  &&  itemSize > 0  &&  capacity > 0, (uintptr_t)storage, itemSize);
     pQ->buf = storage;
     pQ->itemSize = itemSize;
     pQ->capacity = capacity;
@@ -170,7 +170,7 @@ uint8_t rtos_queueCount(const rtos_queue_t *pQ)
 
 void rtos_mboxInit(rtos_mbox_t *pMb, uint8_t *storage, uint8_t itemSize)
 {
-    RTOS_ASSERT(storage != NULL  &&  itemSize > 0);
+    RTOS_CHECK(storage != NULL  &&  itemSize > 0, (uintptr_t)storage, itemSize);
     pMb->buf = storage;
     pMb->itemSize = itemSize;
     pMb->full = 0;

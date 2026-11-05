@@ -19,7 +19,10 @@
  * For every phase and depth the high water mark is read and the chain's own frames are
  * subtracted; what remains is what the kernel and the port left under the chain, and it
  * must not grow with the depth: windows live at the interrupt are spilled into frames
- * the task already owns. Interrupts do not nest on either port (the AVR keeps them off
+ * the task already owns. In phases B and D the probe interrupt also records its own
+ * entry latency (hardware event to the first line of the handler) per depth: on the
+ * ESP32 the interrupt entry spills every live register window, so the latency should
+ * rise with the depth of the interrupted chain until the register file is full. Interrupts do not nest on either port (the AVR keeps them off
  * in an RTOS_ISR, the ESP32 port masks every level it uses), so a second source that
  * fires meanwhile runs after the first on the same spot; the probe and the tick coincide
  * often enough during the spins to include that case.
@@ -40,7 +43,9 @@
 #define EVT_GO          0x1u
 #define EVT_DONE        0x2u
 
-#define IRQ_HZ          2500ul
+#ifndef IRQ_HZ
+# define IRQ_HZ         2500ul
+#endif
 #if !BOARD_APP_TIMER_HZ_IS_EXACT(IRQ_HZ)
 # error IRQ_HZ is not an exact rate of the application timer
 #endif
@@ -71,10 +76,52 @@ static volatile uint8_t _armed;
 static volatile uint32_t _sink;
 static volatile float _fsink;
 static uint32_t _used[NUM_PHASES][NUM_DEPTHS];
+/* Entry latency of the probe while the deep task spins at the bottom (phases B and D),
+   in application timer counts: min, max and sum per phase and depth. */
+static volatile uint8_t _curPhase = 0xFF, _curDepth;
+#if defined(BOARD_IS_ESP32)  &&  BOARD_IS_ESP32
+/* Spike attribution: for every probe whose entry latency exceeds SPIKE_COUNTS, the
+   cycles between the last tick boundary (CCOMPARE0 grid) and the probe's entry. A spike
+   caused by the tick interrupt being served first lies within the tick handler's
+   length after a boundary; any other periodic interference lies elsewhere. */
+# define SPIKE_COUNTS   44u                 /* 1100 ns: the typical entry is 850 */
+# define SPIKES_MAX     16u
+static volatile uint32_t _spikeSince[SPIKES_MAX], _spikeLat[SPIKES_MAX], _spikeIdx[SPIKES_MAX], _spikes, _probesTotal;
+static volatile uint8_t _spikeCell[SPIKES_MAX];
+static volatile uint32_t _sinceMin = 0xFFFFFFFFul, _sinceMax;
+#endif
+static volatile uint32_t _entryMin[NUM_PHASES][NUM_DEPTHS], _entryMax[NUM_PHASES][NUM_DEPTHS],
+                         _entrySum[NUM_PHASES][NUM_DEPTHS], _entryN[NUM_PHASES][NUM_DEPTHS];
 
 RTOS_ISR(BOARD_APP_TIMER_VECT)
 {
+    const uint32_t e = board_appTimerElapsed();
     ++ _irqs;
+#if defined(BOARD_IS_ESP32)  &&  BOARD_IS_ESP32
+    if(_curPhase != 0xFF)
+    {
+        const uint32_t since = rtos_port_ccount() - (rtos_port_nextTick - RTOS_PORT_CYCLES_PER_TICK);
+        ++ _probesTotal;
+        if(since < _sinceMin) _sinceMin = since;
+        if(since > _sinceMax) _sinceMax = since;
+        if(e > SPIKE_COUNTS  &&  _spikes < SPIKES_MAX)
+        {
+            _spikeSince[_spikes] = since;
+            _spikeLat[_spikes] = e;
+            _spikeIdx[_spikes] = _entryN[_curPhase][_curDepth];    /* probes before this one in the cell */
+            _spikeCell[_spikes] = (uint8_t)(_curPhase * 16u + _curDepth);
+            ++ _spikes;
+        }
+    }
+#endif
+    if(_curPhase != 0xFF)
+    {
+        const uint8_t p = _curPhase, d = _curDepth;
+        if(_entryN[p][d] == 0  ||  e < _entryMin[p][d]) _entryMin[p][d] = e;
+        if(e > _entryMax[p][d]) _entryMax[p][d] = e;
+        _entrySum[p][d] += e;
+        ++ _entryN[p][d];
+    }
     if(_armed)
         rtos_notifyFromIsr(TASK_WAKE, 1, RTOS_NOTIFY_INC);
 }
@@ -100,14 +147,32 @@ static void atBottom(uint8_t phase)
     case PHASE_B:
     case PHASE_D:
     {
-        const rtos_tick_t t0 = rtos_getTick();
         float f = 1.5f;
+        _curPhase = phase;                  /* the probe attributes its entry latency */
+#if defined(BOARD_IS_ESP32)  &&  !defined(TC12_SPIN_CALLS)
+        /* Spin without any call, so that the probe measures the kernel's interrupt entry
+           and not the window exceptions of a call8/retw pair in the interrupted code
+           (which mask interrupts for up to 126 cycles; TC12_SPIN_CALLS brings that back,
+           see doc/esp32_hotpath.md). */
+        {
+            const uint32_t c0 = rtos_port_ccount();
+            while(rtos_port_ccount() - c0 < (uint32_t)SPIN_MS * (uint32_t)(F_CPU / 1000ul))
+            {
+                ++ _sink;
+                if(phase == PHASE_D)
+                    f = f * 1.0001f + 0.5f;
+            }
+        }
+#else
+        const rtos_tick_t t0 = rtos_getTick();
         while(rtos_getTick() - t0 < RTOS_MS(SPIN_MS))
         {
             ++ _sink;                       /* the probe and the tick land here */
             if(phase == PHASE_D)
                 f = f * 1.0001f + 0.5f;     /* the FPU trap after every switch back */
         }
+#endif
+        _curPhase = 0xFF;
         _fsink = f;
         break;
     }
@@ -143,6 +208,7 @@ static void taskPhase(void *arg)
     _armed = (phase == PHASE_B  ||  phase == PHASE_D);
     for(i=0; i<NUM_DEPTHS; ++i)
     {
+        _curDepth = (uint8_t)i;
         if(phase == PHASE_A)
         {
             const rtos_port_cs_t cs = rtos_port_enterCritical();
@@ -214,6 +280,33 @@ static void taskScript(void *arg)
             uart_putU32(overhead);
         }
     }
+    for(p=PHASE_B; p<NUM_PHASES; p+=2)
+    {
+        uart_puts("\r\n  ");
+        uart_puts(name[p]);
+        uart_puts(" isr entry avg/max (ns)");
+        for(i=0; i<NUM_DEPTHS; ++i)
+        {
+            const uint32_t n = _entryN[p][i];
+            const uint32_t avg = n ? _entrySum[p][i] / n : 0;
+            uart_putc(' ');
+            uart_putU32((uint32_t)(((uint64_t)avg * 1000000000ull) / BOARD_APP_TIMER_COUNT_HZ));
+            uart_putc('/');
+            uart_putU32((uint32_t)(((uint64_t)_entryMax[p][i] * 1000000000ull) / BOARD_APP_TIMER_COUNT_HZ));
+        }
+    }
+#if defined(BOARD_IS_ESP32)  &&  BOARD_IS_ESP32
+    uart_puts("\r\n  probes "); uart_putU32(_probesTotal);
+    uart_puts(" spread over the tick period "); uart_putU32(_sinceMin); uart_puts(".."); uart_putU32(_sinceMax);
+    uart_puts(" cycles after a tick boundary; spikes > 1100 ns: "); uart_putU32(_spikes);
+    for(i=0; i<_spikes; ++i)
+    {
+        uart_puts("\r\n    spike "); uart_putU32((uint32_t)(((uint64_t)_spikeLat[i] * 1000000000ull) / BOARD_APP_TIMER_COUNT_HZ));
+        uart_puts(" ns entered "); uart_putU32(_spikeSince[i]); uart_puts(" cycles after the tick boundary, probe #");
+        uart_putU32(_spikeIdx[i]); uart_puts(" of phase "); uart_putc((char)('A' + _spikeCell[i] / 16u));
+        uart_puts(" depth "); uart_putU32(_depths[_spikeCell[i] % 16u]);
+    }
+#endif
     uart_puts("\r\n  irqs ");
     uart_putU32(_irqs);
     uart_puts(" woken ");
@@ -225,6 +318,26 @@ static void taskScript(void *arg)
     tc_expectRange("woken", _woken, 100, 0xFFFFFFFFul);
     tc_expectRange("perFrame", perFrame, 1, 128);
     tc_expectRange("overheadMax", overheadMax, 1, RTOS_PORT_MIN_STACK);
+#if defined(BOARD_IS_ESP32)  &&  BOARD_IS_ESP32  &&  !defined(TC12_SPIN_CALLS)  &&  TC_TOLERANCE_PERMILLE <= 10u
+    /* The interrupt entry must not depend on the depth of the interrupted chain: the
+       per depth averages within 10 % of each other, and no entry beyond 1.4 us (the
+       typical is 0.85 us, a probe served right behind a tick handler 1.15 us). On the
+       board only: QEMU's timing is not accurate enough for a 10 % criterion. */
+    {
+        uint32_t avgMin = 0xFFFFFFFFul, avgMax = 0, maxAll = 0;
+        for(p=PHASE_B; p<NUM_PHASES; p+=2)
+            for(i=0; i<NUM_DEPTHS; ++i)
+            {
+                const uint32_t n = _entryN[p][i];
+                const uint32_t avg = n ? _entrySum[p][i] / n : 0;
+                if(avg < avgMin) avgMin = avg;
+                if(avg > avgMax) avgMax = avg;
+                if(_entryMax[p][i] > maxAll) maxAll = _entryMax[p][i];
+            }
+        tc_expectRange("entryAvgSpread", avgMax * 100u, 0, avgMin * 110u);
+        tc_expectRange("entryMaxNs", (uint32_t)(((uint64_t)maxAll * 1000000000ull) / BOARD_APP_TIMER_COUNT_HZ), 1, 1400ul);
+    }
+#endif
     tc_finish("tc12");
 }
 

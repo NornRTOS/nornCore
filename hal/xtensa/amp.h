@@ -5,8 +5,12 @@
  * Asymmetric multiprocessing on the ESP32: one nornOS image per core, each with its own
  * kernel, and a message link between them through the shared memory window both
  * linker layouts reserve (mem_core0.ld, mem_core1.ld). One ring buffer per direction,
- * single producer and single consumer, 16 byte messages; the sender raises the other
- * core's FROM_CPU interrupt, whose handler gives a semaphore the receiving task waits on.
+ * one producing core and one consuming core, 16 byte messages; the sender raises the
+ * other core's FROM_CPU interrupt, whose handler gives a semaphore the receiving task
+ * waits on. Several tasks of the same core may send, and several may receive: the slot
+ * index updates are critical sections on that core. Across the cores nothing is locked,
+ * which is what makes the link cheap; it relies on each core being the only writer of
+ * its own index.
  *
  * Core 0 builds the link, loads and starts core 1 (rtos_port_startAppCpu with the image
  * the build embedded) and must call amp_init before rtos_start. Core 1 calls amp_init
@@ -31,7 +35,8 @@ void amp_init(void);
 /** Queue a message for the other core; false if its ring is full. Task context. */
 bool amp_send(const amp_msg_t *pMsg);
 
-/** Wait up to \a timeout ticks for a message from the other core. */
+/** Wait up to \a timeout ticks, counted over the whole call, for a message from the
+    other core; false on timeout. RTOS_FOREVER and RTOS_NO_WAIT as everywhere. */
 bool amp_receive(amp_msg_t *pMsg, rtos_tick_t timeout);
 
 /** Messages waiting for this core. */

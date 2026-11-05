@@ -40,7 +40,7 @@ void rtos_poolInit(rtos_pool_t *pPool, uint8_t *storage, uint16_t blockSize, uin
     uint8_t i;
     uint8_t *p = storage;
 
-    RTOS_ASSERT(storage != NULL  &&  blockSize >= sizeof(void *)  &&  numBlocks > 0);
+    RTOS_CHECK(storage != NULL  &&  blockSize >= sizeof(void *)  &&  numBlocks > 0, (uintptr_t)storage, blockSize);
     pPool->storage = storage;
     pPool->blockSize = blockSize;
     pPool->numBlocks = numBlocks;
@@ -90,17 +90,17 @@ void *rtos_poolAllocFromIsr(rtos_pool_t *pPool)
 
 void rtos_poolFreeFromIsr(rtos_pool_t *pPool, void *pBlock)
 {
-    RTOS_ASSERT((uint8_t *)pBlock >= pPool->storage
+    RTOS_CHECK((uint8_t *)pBlock >= pPool->storage
                 &&  (uint8_t *)pBlock < pPool->storage + (uint16_t)pPool->blockSize * pPool->numBlocks
                 &&  ((uint16_t)((uint8_t *)pBlock - pPool->storage)) % pPool->blockSize == 0
-               );
+               , (uintptr_t)pBlock, (uintptr_t)pPool->storage);
     if(pPool->waiters != 0)
     {
         *(void **)rtos_kernel_releaseHighestWaiter(&pPool->waiters)->pXfer = pBlock;
     }
     else
     {
-        RTOS_ASSERT(pPool->numFree < pPool->numBlocks);
+        RTOS_CHECK(pPool->numFree < pPool->numBlocks, (uintptr_t)pBlock, pPool->numFree);   /* freed twice */
         *(void **)pBlock = pPool->pFree;
         pPool->pFree = pBlock;
         ++ pPool->numFree;

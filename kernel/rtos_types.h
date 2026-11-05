@@ -72,8 +72,8 @@
 
 /** Every option that changes the kernel's data layout or behaviour, folded into one
     number. rtos_init passes the application's value to the kernel, which compares it with
-    its own: a kernel library built for another configuration profile is caught at start
-    (RTOS_PANIC_CONFIG) instead of corrupting memory. */
+    its own: a kernel built from another configuration (stale objects, a library) is caught
+    at start (RTOS_PANIC_CONFIG) instead of corrupting memory. */
 #define RTOS_CONFIG_SIGNATURE                                                       \
     ( (uint32_t)(RTOS_CFG_NUM_TASKS & 31u)                                          \
     | ((uint32_t)(RTOS_CFG_TICK_BITS / 16u) << 5)                                   \

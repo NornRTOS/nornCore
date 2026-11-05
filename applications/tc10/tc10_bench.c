@@ -76,10 +76,18 @@
 #define NS_OF_CYCLES(c) ((uint32_t)(((uint64_t)(c) * 1000000000ull) / BOARD_CYCLES_HZ))
 #define NS_OF_HIRES(c)  ((uint32_t)(((uint64_t)(c) * 1000000000ull) / BOARD_HIRES_TIMER_COUNT_HZ))
 
-/* Limits for PASS, in ns: far above the expected values. */
+/* Limits for PASS, in ns: far above the expected values. An emulator (TC_TOLERANCE_PERMILLE
+   raised for it, as tc04 does) stalls for milliseconds when its host is busy, so its
+   latency limits are wider still; the numbers printed are what matters there, not the
+   limits. */
 #define LIMIT_SWITCH_NS     100000ul
-#define LIMIT_ISR_ENTRY_NS  300000ul
-#define LIMIT_ISR_TASK_NS   300000ul
+#if TC_TOLERANCE_PERMILLE > 10u
+# define LIMIT_ISR_ENTRY_NS 3000000ul
+# define LIMIT_ISR_TASK_NS  3000000ul
+#else
+# define LIMIT_ISR_ENTRY_NS 300000ul
+# define LIMIT_ISR_TASK_NS  300000ul
+#endif
 
 enum { MODE_SEM, MODE_NOTIFY, MODE_QUEUE, MODE_EVENTS };
 
