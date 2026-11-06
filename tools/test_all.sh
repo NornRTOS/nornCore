@@ -58,6 +58,16 @@ result_of() {   # app logfile -> PASS/FAIL/NONE and the detail line
     fi
 }
 
+# ---- the host test runner itself: a test that fails must fail `make host-test`, or every
+#      host result below is meaningless.
+probe=$LOGS/failing-probe
+printf '#!/bin/sh\necho "FAIL: probe"\nexit 7\n' > "$probe"; chmod +x "$probe"
+if make -s host-test HOST_TESTS="$probe" > "$LOGS/host-runner.log" 2>&1; then
+    report "host-runner" FAIL "a failing test did not fail make host-test"
+else
+    report "host-runner" PASS "a failing test fails the target"
+fi
+
 # ---- host unit tests
 log=$LOGS/host.log
 if make -s host-test > "$log" 2>&1; then

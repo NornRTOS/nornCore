@@ -65,6 +65,7 @@ void rtos_wdtMonitor(uint8_t task, rtos_tick_t maxInterval)
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
     RTOS_CHECK(task >= 1  &&  task < RTOS_NUM_TASKS, task, RTOS_NUM_TASKS);
+    RTOS_CHECK(maxInterval <= RTOS_MAX_TIMEOUT, maxInterval, RTOS_MAX_TIMEOUT);
     if(maxInterval == 0)
         _monitored &= (rtos_taskmask_t)~rtos_tcbAry[task].bit;
     else

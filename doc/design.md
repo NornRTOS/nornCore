@@ -34,6 +34,15 @@ blocks while holding the mutex (allowed but discouraged), contenders fall back t
 and get the mutex handed over in priority order; the hand-over raises the new owner
 immediately. A lock that would wait follows the chain of owners and panics on a cycle.
 
+The ready mask is indexed by base priority, so a boosted task that is ready but not
+running (an owner that blocked while holding, or a waiter that was just handed the
+mutex) is not found by the highest ready bit. The kernel keeps a second mask of the
+tasks whose effective priority differs from their base priority (rtos_kernel_boostedMask,
+maintained by rtos_kernel_setEffPrio); the task picker (rtos_kernel_pickReady, shared by
+the scheduler and the interrupt tail) scans those few tasks for the highest effective
+priority only while one of them is ready, and otherwise costs one mask test on top of
+the highest bit lookup. The preemption rule compares effective priorities on both sides.
+
 Critical sections are short interrupt masks with the previous state restored, nestable.
 There is no kernel lock besides them; every kernel operation runs with interrupts masked
 for a bounded number of instructions, which is what gives the interrupt latency figures

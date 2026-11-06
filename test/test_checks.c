@@ -26,6 +26,7 @@ static rtos_mbox_t _mb;
 static rtos_pool_t _pool;
 static rtos_timer_t _tmr;
 static uint8_t _foreign[64];
+static rtos_sem_t _sem = RTOS_SEM_INIT_BINARY(0);
 
 void rtos_panicHook(const rtos_panicInfo_t *pInfo)
 {
@@ -38,6 +39,8 @@ void rtos_panicHook(const rtos_panicInfo_t *pInfo)
     printf("scenario %d FAIL: panic reason %u instead of ARGUMENT\n", _scenario, pInfo->reason);
     exit(1);
 }
+
+static void cb(void *arg) { (void)arg; }
 
 static void task1(void *arg)
 {
@@ -56,6 +59,13 @@ static void task1(void *arg)
     case 12: (void)rtos_getOverrunCount(RTOS_NUM_TASKS, false); break;   /* id used as an index */
     case 13: rtos_timerStart(&_tmr, 1, 0); break;                 /* never initialized */
     case 14: { rtos_poolInit(&_pool, _storage, 8, 4); { void *b = rtos_poolAlloc(&_pool, 0); rtos_poolFree(&_pool, b); rtos_poolFree(&_pool, b); } break; }
+    /* Timeouts beyond half the tick range (audit F6). */
+    case 16: (void)rtos_semTake(&_sem, (rtos_tick_t)(RTOS_MAX_TIMEOUT + 1u)); break;
+    case 17: rtos_timerInit(&_tmr, cb, NULL); rtos_timerStart(&_tmr, (rtos_tick_t)(RTOS_MAX_TIMEOUT + 1u), 0); break;
+    case 18: rtos_timerInit(&_tmr, cb, NULL); rtos_timerStart(&_tmr, 1, (rtos_tick_t)(RTOS_MAX_TIMEOUT + 1u)); break;
+    case 19: (void)rtos_waitPeriodic((rtos_tick_t)(RTOS_MAX_TIMEOUT + 1u)); break;
+    case 20: (void)rtos_waitPeriodic(0); break;                   /* no period */
+    case 21: rtos_wdtInit(100); rtos_wdtMonitor(T1, (rtos_tick_t)(RTOS_MAX_TIMEOUT + 1u)); break;
     default: break;
     }
     printf("scenario %d FAIL: the call returned\n", _scenario);
@@ -78,7 +88,7 @@ static int runScenario(int n)
     return 1;
 }
 
-#define NUM_SCENARIOS 15
+#define NUM_SCENARIOS 21
 
 void test_idleHook(void)
 {

@@ -69,6 +69,15 @@
 /** Timeout value meaning "do not block, just poll". */
 #define RTOS_NO_WAIT            ((rtos_tick_t)0)
 
+/** The longest finite timeout, timer delay or period, periodic wait and watchdog interval
+    in ticks: half the range of the tick type (32767 ticks with 16 bit ticks, about 32.7 s
+    at 1 kHz; 2^31 - 1 with 32 bit ticks, about 24.8 days). The kernel compares tick
+    values as signed differences, which is what lets the counter wrap freely, and that
+    only works within half the range. A larger value (other than RTOS_FOREVER) is a
+    contract violation: RTOS_PANIC_ARGUMENT. rtos_delay is the exception: it takes any
+    value and splits a longer delay into waits of at most this length. */
+#define RTOS_MAX_TIMEOUT        ((rtos_tick_t)(RTOS_FOREVER >> 1))
+
 /** Option for rtos_waitEvents: resume when any of the masked events is pending. */
 #define RTOS_WAIT_ANY           0u
 
@@ -339,7 +348,9 @@ void rtos_start(void);
 /** Current tick count since rtos_start. */
 rtos_tick_t rtos_getTick(void);
 
-/** Block the calling task for at least \a ticks ticks (the real delay is ticks..ticks+1). */
+/** Block the calling task for at least \a ticks ticks (the real delay is ticks..ticks+1).
+    Any value works: RTOS_FOREVER blocks for good, a delay of RTOS_MAX_TIMEOUT or more is
+    done as a sequence of waits (then it may be up to one tick longer per extra wait). */
 void rtos_delay(rtos_tick_t ticks);
 
 /** Block the calling task until the next period boundary. The boundary is computed from the
@@ -349,7 +360,7 @@ void rtos_delay(rtos_tick_t ticks);
     (harmless, it just re-bases). Returns true if the boundary was already in the past
     (task overrun). In that case the task continues immediately and the next boundary is
     re-based on now. */
-bool rtos_waitPeriodic(rtos_tick_t period);
+bool rtos_waitPeriodic(rtos_tick_t period);   /* period 1..RTOS_MAX_TIMEOUT */
 
 /* --- Event flags --------------------------------------------------------------------- */
 
@@ -471,7 +482,8 @@ void rtos_timerInit(rtos_timer_t *pT, rtos_timerFunc_t callback, void *arg);
 /** Arm the timer to fire after \a delay ticks (delay..delay+1, as rtos_delay; 0 means
     the next tick, never the current one, so a callback may restart its timer with 0) and
     then every \a period ticks exactly (0 for one shot). Restarts a running timer. Usable
-    from tasks, ISR bodies and timer callbacks. */
+    from tasks, ISR bodies and timer callbacks. \a delay and \a period at most
+    RTOS_MAX_TIMEOUT. */
 void rtos_timerStart(rtos_timer_t *pT, rtos_tick_t delay, rtos_tick_t period);
 
 /** Disarm the timer; nothing happens if it is not active. Usable from ISR bodies. */
@@ -485,7 +497,10 @@ rtos_tick_t rtos_timerRemaining(const rtos_timer_t *pT);
 
 /* --- Memory pool ------------------------------------------------------------------- */
 
-/** Build the free list over \a storage, which must hold blockSize*numBlocks bytes. */
+/** Build the free list over \a storage, which must hold blockSize*numBlocks bytes. Any
+    alignment of the storage and any block size from sizeof(void *) up work; a block is
+    returned at the alignment of its offset, so storage meant for aligned objects must be
+    aligned itself and have a block size that is a multiple of that alignment. */
 void rtos_poolInit(rtos_pool_t *pPool, uint8_t *storage, uint16_t blockSize, uint8_t numBlocks);
 
 /** Get a block, blocking up to \a timeout ticks if none is free. NULL on timeout. */
@@ -565,8 +580,10 @@ uint8_t rtos_getOverrunCount(uint8_t taskId, bool reset);
     RTOS_CFG_STACK_CHECK. Returns 0 for the idle task. */
 size_t rtos_getStackFree(uint8_t taskId);
 
-/** Microseconds since start, derived from the tick counter and the timer register (wraps
-    after 71 minutes; use differences). Usable from ISR bodies. */
+/** Microseconds since start, from the port's free running time base (the tick timer's
+    32 bit count on the AVR, the cycle counter on the ESP32), independent of the tick
+    width: it wraps only at 2^32 us, after 71.6 minutes; use differences. Usable from ISR
+    bodies. */
 uint32_t rtos_getTimeUs(void);
 
 /** Accumulated run time of a task in counts of RTOS_RUNTIME_HZ, measured at every
@@ -626,7 +643,8 @@ void rtos_stackWarnHook(uint8_t task, size_t stackFree);
 void rtos_wdtInit(uint32_t timeoutMs);
 
 /** Require \a task to call rtos_wdtCheckIn at least every \a maxInterval ticks;
-    0 stops monitoring it. The first deadline is maxInterval from now. */
+    0 stops monitoring it, at most RTOS_MAX_TIMEOUT. The first deadline is maxInterval
+    from now. */
 void rtos_wdtMonitor(uint8_t task, rtos_tick_t maxInterval);
 
 /** The calling task is alive; resets its deadline. */

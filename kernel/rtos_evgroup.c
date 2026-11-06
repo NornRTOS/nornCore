@@ -72,7 +72,13 @@ void rtos_evgroupClear(rtos_evgroup_t *pG, rtos_evt_t bits)
 
 rtos_evt_t rtos_evgroupGet(const rtos_evgroup_t *pG)
 {
-    return pG->bits;
+    /* A snapshot: the bits are wider than a byte and an ISR may set them between the
+       two byte loads of an 8 bit CPU. Nestable, so callable from an ISR as well. */
+    rtos_evt_t bits;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+    bits = pG->bits;
+    rtos_port_exitCritical(cs);
+    return bits;
 }
 
 rtos_evt_t rtos_evgroupWait(rtos_evgroup_t *pG, rtos_evt_t mask, uint8_t options, rtos_tick_t timeout)

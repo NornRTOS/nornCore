@@ -394,8 +394,10 @@ void rtos_port_exception(uint32_t cause, uint32_t *pFrame)
 
 static bool core1Window(uint32_t addr, uint32_t len)
 {
-    return (addr >= CORE1_IRAM_START  &&  len <= CORE1_IRAM_END - addr)
-           ||  (addr >= CORE1_DRAM_START  &&  len <= CORE1_DRAM_END - addr);
+    /* addr <= END before the subtraction: an address above a window would otherwise
+       underflow END - addr to a huge value and pass. */
+    return (addr >= CORE1_IRAM_START  &&  addr <= CORE1_IRAM_END  &&  len <= CORE1_IRAM_END - addr)
+           ||  (addr >= CORE1_DRAM_START  &&  addr <= CORE1_DRAM_END  &&  len <= CORE1_DRAM_END - addr);
 }
 
 void rtos_port_startAppCpu(const uint8_t *image, uint32_t size)
@@ -500,12 +502,16 @@ void rtos_port_idleSleepTicks(rtos_tick_t ticks)
     const rtos_port_cs_t cs = rtos_port_enterCritical();
     uint32_t n = ticks == RTOS_FOREVER ? 1000ul : (uint32_t)ticks;
 
-    /* Never sleep past half the watchdog timeout, and not for very long anyway, so that
-       the 32 bit cycle arithmetic stays well defined. */
+    /* Never sleep past half the watchdog timeout, and never further than 2^30 cycles:
+       the catch-up below compares CCOUNT differences as signed 32 bit values, which only
+       works within half the counter range (1000 ticks at 1 kHz is 240 M cycles; a 100 Hz
+       tick would make 1000 ticks 2.4 G cycles and break it, hence the bound in cycles). */
     if(_wdtTimeoutMs != 0  &&  n > _wdtTimeoutMs * RTOS_CFG_TICK_HZ / 2000ul)
         n = (uint32_t)(_wdtTimeoutMs * RTOS_CFG_TICK_HZ / 2000ul);
     if(n > 1000ul)
         n = 1000ul;
+    if(n > (1ul << 30) / CYCLES_PER_TICK)
+        n = (1ul << 30) / CYCLES_PER_TICK;
     if(n > 1)
         wsr_ccompare0(_nextTick + (n - 1u) * CYCLES_PER_TICK);
 

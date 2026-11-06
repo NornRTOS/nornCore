@@ -202,6 +202,7 @@ void rtos_timerStart(rtos_timer_t *pT, rtos_tick_t delay, rtos_tick_t period)
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
     RTOS_CHECK(pT->callback != NULL, (uintptr_t)pT, 0);  /* rtos_timerInit first */
+    RTOS_CHECK(delay <= RTOS_MAX_TIMEOUT  &&  period <= RTOS_MAX_TIMEOUT, delay, period);
     if(pT->active)
         remove(pT);
     pT->period = period;

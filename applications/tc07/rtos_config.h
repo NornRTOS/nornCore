@@ -5,7 +5,7 @@
  * Kernel configuration of test case tc07, core 0.
  */
 
-#define RTOS_CFG_NUM_TASKS      3
+#define RTOS_CFG_NUM_TASKS      4
 #define RTOS_CFG_TICK_HZ        1000ul
 #define RTOS_CFG_TICK_BITS      32
 #define RTOS_CFG_EVT_BITS       16

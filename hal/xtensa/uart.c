@@ -87,6 +87,9 @@ static void rxIsr(void)
 
 void uart_onReceive(void (*fn)(uint8_t c, void *arg), void *arg)
 {
+    /* Callback and argument change together: a receive interrupt between the two stores
+       would call the old function with the new argument (or NULL). */
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
     _rxArg = arg;
     _rxFn = fn;
     if(fn != NULL)
@@ -99,6 +102,7 @@ void uart_onReceive(void (*fn)(uint8_t c, void *arg), void *arg)
     }
     else
         UART_INT_ENA &= ~(UART_INT_RXFIFO_FULL | UART_INT_RXFIFO_TOUT);
+    rtos_port_exitCritical(cs);
 }
 
 /** Wait until every queued byte has left the FIFO, e.g. before changing the baud rate. */

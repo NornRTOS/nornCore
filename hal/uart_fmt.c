@@ -36,12 +36,14 @@ void uart_putU32(uint32_t n)
 
 void uart_putI32(int32_t n)
 {
+    /* The magnitude is formed in unsigned arithmetic: -INT32_MIN does not exist. */
     if(n < 0)
     {
         uart_putc('-');
-        n = -n;
+        uart_putU32(0u - (uint32_t)n);
     }
-    uart_putU32((uint32_t)n);
+    else
+        uart_putU32((uint32_t)n);
 }
 
 void uart_putHex8(uint8_t b)

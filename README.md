@@ -42,7 +42,10 @@ touched; doc/porting.md describes the port interface.
     make APP=tc01 BOARD=uno   build for another board than app.mk says
     make APP=tc01 sim         run in simavr, UART0 output on the terminal
     make APP=tc01 upload PORT=/dev/ttyACM0
-    make host-test            kernel unit tests on the PC, with ASan and UBSan
+    make host-test            kernel unit tests on the PC, with ASan and UBSan; a test
+                              passes only if it exits 0 and ends with a PASS line
+    tools/measure.sh LABEL    size and timing snapshot (tc01 size per board, tc10/tc11/
+                              tc12 on the Mega, the ESP32 and QEMU) -> doc/measurements/
     make test-all             host tests, every tc in simavr for uno and mega2560, and on
                               an ESP32 at /dev/ttyUSB0 if present (tools/test_all.sh);
                               AVR_HW="mega2560:/dev/ttyACM0" adds a real AVR board
@@ -92,7 +95,10 @@ a sub-application built with the core 1 memory layout (port/xtensa/mem_core1.ld)
 embedded in the core 0 image, which copies it into place and starts the APP CPU at boot
 (rtos_port_startAppCpu). hal/xtensa/amp.c is the link: one ring buffer per direction in
 the shared window, 16 byte messages, the receiver woken by the other core's FROM_CPU
-interrupt. tc07 shows it: 200 requests per second answered by core 1, 10 us round trip.
+interrupt. Several tasks of one core may receive: signals that arrive together merge
+into one interrupt, so a receiver that takes a message and leaves more behind wakes the
+next one. tc07 shows it: 200 requests per second answered by core 1, 6 us round trip,
+then 20 bursts of two replies to two receivers of which the first stays busy.
 
 ## Three configurations to start from
 
@@ -157,8 +163,14 @@ with RTOS_PANIC_CONFIG instead of corrupting memory.
 * Software timers: static rtos_timer_t objects, one shot or periodic without drift, in a
   list sorted by expiry. The callback runs in the tick interrupt with interrupts disabled,
   so keep it short and use *FromIsr functions or rtos_timerStart/Stop only.
+* Timeouts, timer delays and periods, periodic waits and watchdog intervals are at most
+  RTOS_MAX_TIMEOUT, half the tick range (32767 ticks with 16 bit ticks, 2^31 - 1 with
+  32 bit ticks); the kernel compares ticks as signed differences so the counter may wrap.
+  A larger value is RTOS_PANIC_ARGUMENT, except in rtos_delay, which splits it.
 * Mutexes use the immediate priority ceiling protocol: the owner runs at the ceiling, so
-  with a correct ceiling nobody ever blocks on the mutex and deadlock is impossible.
+  with a correct ceiling nobody ever blocks on the mutex and deadlock is impossible. An
+  owner that blocks while holding (allowed, discouraged) keeps the ceiling and is
+  scheduled by it when it wakes; so is a waiter the mutex is handed over to.
 * Interrupts that talk to the kernel are written with RTOS_ISR(vector) { ... } and use
   the *FromIsr functions; a task switch, if needed, happens once at the end of the ISR.
 * Critical sections are short cli/sei pairs with the previous state saved (nestable).
@@ -241,6 +253,13 @@ Three layers, all run by `make test-all` (about a minute with an ESP32 connected
                        through a scripted sequence of calls, simulated ticks and simulated
                        interrupts, and the trace of (task, event, value) is compared with
                        the expected one. Built with -Wconversion, ASan and UBSan.
+    test/test_timeout.c timeouts at the limit with 16 bit ticks: delays of RTOS_MAX_TIMEOUT
+                       + 1000 and RTOS_FOREVER - 1, a wait of exactly the limit beside short
+                       ones, timers and a periodic wait of the limit
+    test/test_prio.c   the scheduler against mutex ceilings: an owner that blocked while
+                       holding is switched to by the interrupt tail when it wakes, a
+                       waiter handed the mutex runs before a task between its base
+                       priority and the ceiling, nested ceilings restore in LIFO order
     test/test_robust.c robustness features on the host port, one child process per
                        scenario: deadlock, stack canary, task watchdog, timer task,
                        statistics and binary semaphore, task info, trace, assertion
@@ -265,7 +284,9 @@ Three layers, all run by `make test-all` (about a minute with an ESP32 connected
                        by SEED, so a failure reproduces; 8 seeds x 200000 ticks pass.
     applications/tc*   on the target: each test case checks its own counters at the end
                        and prints RESULT tcNN PASS or FAIL (hal/testresult.h), then halts,
-                       which ends a simavr run. tools/test_all.sh collects the lines.
+                       which ends a simavr run. tools/test_all.sh collects the lines,
+                       after first checking that a failing host test fails `make
+                       host-test` (the runner once piped into tail and hid exit codes).
 
 `make host-cov` builds the host tests with gcov and prints the line coverage of every
 kernel file and the uncovered line ranges (tools/host_cov.sh); the kernel is at 98.8 %,
@@ -273,6 +294,11 @@ the rest being the reset paths of rtos_panic.c, which the host cannot take, and 
 stack realignment that only the ESP32 needs. `make analyze` runs gcc's static analyzer
 (-fanalyzer) over the kernel, the ports and the HAL with each architecture's compiler
 (tools/analyze.sh); it reports nothing on any of them.
+
+Every change that may touch the hot path, the stacks or the code size is measured before
+and after with `tools/measure.sh <label>`; the summaries live in doc/measurements/
+(baseline.md is the state before the 2026-11-05 audit fixes) and the raw logs in
+build/measure/<label>/.
 
 tc01..tc06 pass on a real Mega 2560 with the same counters as simavr, on the ESP32 board
 and in QEMU. Not covered yet: a real UNO, and static analysis beyond the compiler warnings
@@ -313,8 +339,12 @@ is exact for stack use:
     esp32      192           192              336                         512   (board)
     esp32      300           300              336                         512   (QEMU)
 
-QEMU spills register windows earlier than the chip (its register file is smaller), so
-its blocking figure is higher than the board's; the interrupt figure is the same.
+The "only blocks" figure is 192 on the board when no interrupt happens to land on the
+task during its short runs and 300 when one does (the 112 byte exception frame plus the
+handler's save area pointer, below the task's two frames): which of the two tc11 prints
+depends on the timing of the 1 kHz test interrupt against the task, so a change of a few
+cycles anywhere can flip it, and QEMU always shows it. The figure to size a stack by is
+the interrupted one (336 on the ESP32), which does not depend on this.
 
 ### Stacks
 

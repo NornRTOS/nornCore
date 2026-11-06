@@ -45,10 +45,14 @@ static const entry_t _expected[] =
     { T3, "stats", 1 },
     /* --- event group: T2 waits ALL 0x3 with clear, T1 waits ANY 0x1, T3 sets. T3 is
        the highest priority, so it runs on until it blocks; then T2 before T1. --- */
+    { T3, "privateKeepsGroupWait", 1 }, /* a private event posted to a task waiting on a
+                                           group must not end the group wait (audit F1) */
     { T3, "bitsAfterSet1", 0x1 },       /* T1 got 0x1 handed over, did not clear it */
     { T3, "bitsAfterSet2", 0x0 },       /* set 0x2: T2 took 0x3 and cleared it */
     { T2, "evALL", 0x3 },
+    { T2, "privateStillPending", 0x1 }, /* ... and the private event is still there */
     { T1, "evANY", 0x1 },
+    { T1, "privateStillPending", 0x1 },
     { T1, "evTimeout", 0 },
     /* --- suspend/resume --- */
     { T3, "infoSuspended", RTOS_TASK_SUSPENDED },
@@ -96,6 +100,7 @@ static void task1(void *arg)
     (void)arg;
     got = rtos_evgroupWait(&_group, 0x1, RTOS_WAIT_ANY, RTOS_FOREVER);
     trace(T1, "evANY", got);
+    trace(T1, "privateStillPending", rtos_waitEvents(0x1, RTOS_WAIT_ANY, RTOS_NO_WAIT));
     got = rtos_evgroupWait(&_group, 0x8, RTOS_WAIT_ANY, 2);
     trace(T1, "evTimeout", got);
     /* T3 suspends us while we wait here, then posts the event, then resumes us. */
@@ -112,6 +117,7 @@ static void task2(void *arg)
     (void)arg;
     got = rtos_evgroupWait(&_group, 0x3, RTOS_WAIT_ALL | RTOS_WAIT_CLEAR, RTOS_FOREVER);
     trace(T2, "evALL", got);
+    trace(T2, "privateStillPending", rtos_waitEvents(0x1, RTOS_WAIT_ANY, RTOS_NO_WAIT));
     for(;;)
         rtos_delay(100);
 }
@@ -147,6 +153,12 @@ static void task3(void *arg)
 
     /* event group */
     rtos_delay(1);                      /* let T1 and T2 block in their waits */
+    rtos_postEvents(T1, 0x1);           /* private events, same bit as the group masks: */
+    rtos_postEvents(T2, 0x1);           /* both must stay blocked on the group */
+    rtos_getTaskInfo(T1, &info);
+    trace(T3, "privateKeepsGroupWait", info.state == RTOS_TASK_BLOCKED && info.waitKind == RTOS_WAIT_EVGROUP);
+    rtos_getTaskInfo(T2, &info);
+    if(info.state != RTOS_TASK_BLOCKED) trace(T3, "privateKeepsGroupWait", 0);
     rtos_evgroupSet(&_group, 0x1);      /* T1 wakes (ANY), T2 needs 0x3 */
     trace(T3, "bitsAfterSet1", rtos_evgroupGet(&_group));
     rtos_evgroupSet(&_group, 0x2);      /* T2 wakes with 0x3 and clears it */

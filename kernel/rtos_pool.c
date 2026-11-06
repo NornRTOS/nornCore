@@ -4,8 +4,14 @@
  * through the blocks themselves, so allocation and release are O(1) and the pool needs no
  * bookkeeping memory beyond the blocks. A blocking allocation hands the released block
  * straight to the highest priority waiter (see rtos_queue.c for the rationale).
+ *   The link is read and written with memcpy: the storage is a byte array of any
+ * alignment and the block size any value from sizeof(void *) up, so a pointer access
+ * through the block would be misaligned (a fault on the Xtensa, undefined behaviour
+ * everywhere). memcpy of a pointer compiles to the same load or store when the compiler
+ * can prove alignment and to byte accesses otherwise.
  */
 
+#include <string.h>
 #include "rtos.h"
 #include "rtos_assert.h"
 #include "rtos_kernel.h"
@@ -22,7 +28,7 @@ static inline void *take(rtos_pool_t *pPool)
 
     if(pBlock != NULL)
     {
-        pPool->pFree = *(void **)pBlock;
+        memcpy(&pPool->pFree, pBlock, sizeof(void *));
         -- pPool->numFree;
         if(pPool->numFree < pPool->minFree)
             pPool->minFree = pPool->numFree;
@@ -49,10 +55,14 @@ void rtos_poolInit(rtos_pool_t *pPool, uint8_t *storage, uint16_t blockSize, uin
     pPool->pFree = storage;
     for(i=1; i<numBlocks; ++i)
     {
-        *(void **)p = p + blockSize;
-        p += blockSize;
+        void * const pNext = p + blockSize;
+        memcpy(p, &pNext, sizeof(void *));
+        p = pNext;
     }
-    *(void **)p = NULL;
+    {
+        void * const pNone = NULL;
+        memcpy(p, &pNone, sizeof(void *));
+    }
     pPool->minFree = numBlocks;
     pPool->failed = 0;
 }
@@ -90,9 +100,11 @@ void *rtos_poolAllocFromIsr(rtos_pool_t *pPool)
 
 void rtos_poolFreeFromIsr(rtos_pool_t *pPool, void *pBlock)
 {
+    /* The block must be one of the pool's: inside the storage and on a block boundary.
+       The offset is kept in size_t: a pool may exceed 64 KiB where the RAM allows. */
     RTOS_CHECK((uint8_t *)pBlock >= pPool->storage
-                &&  (uint8_t *)pBlock < pPool->storage + (uint16_t)pPool->blockSize * pPool->numBlocks
-                &&  ((uint16_t)((uint8_t *)pBlock - pPool->storage)) % pPool->blockSize == 0
+                &&  (size_t)((uint8_t *)pBlock - pPool->storage) < (size_t)pPool->blockSize * pPool->numBlocks
+                &&  (size_t)((uint8_t *)pBlock - pPool->storage) % pPool->blockSize == 0
                , (uintptr_t)pBlock, (uintptr_t)pPool->storage);
     if(pPool->waiters != 0)
     {
@@ -101,7 +113,7 @@ void rtos_poolFreeFromIsr(rtos_pool_t *pPool, void *pBlock)
     else
     {
         RTOS_CHECK(pPool->numFree < pPool->numBlocks, (uintptr_t)pBlock, pPool->numFree);   /* freed twice */
-        *(void **)pBlock = pPool->pFree;
+        memcpy(pBlock, &pPool->pFree, sizeof(void *));
         pPool->pFree = pBlock;
         ++ pPool->numFree;
     }

@@ -82,9 +82,25 @@ typedef struct rtos_tcb
 extern rtos_tcb_t rtos_tcbAry[RTOS_NUM_TASKS];
 extern rtos_tcb_t *rtos_pCurrent;
 extern rtos_tcb_t *rtos_pNext;
-extern volatile uint8_t rtos_needSwitch;
 extern volatile rtos_tick_t rtos_tickCount;
-extern rtos_taskmask_t rtos_kernel_readyMask;
+
+/** The scheduler's state bytes, in one object so that every pick addresses them from a
+    single base (on the Xtensa one l32r instead of three): the ready mask (bit n set:
+    task n is ready; bit 0, the idle task, always), the boosted mask (the tasks whose
+    effective priority is above their own, holding a mutex with a higher ceiling; the
+    ready mask is indexed by base priority, so while one of these is ready the pick must
+    look at effective priorities instead of the highest ready bit), and the switch request
+    set whenever a task was made ready from an ISR, evaluated by rtos_isrTail. */
+typedef struct rtos_kernel_sched_t
+{
+    rtos_taskmask_t ready;
+    rtos_taskmask_t boosted;
+    volatile uint8_t needSwitch;
+} rtos_kernel_sched_t;
+extern rtos_kernel_sched_t rtos_kernel_sched;
+#define rtos_kernel_readyMask   (rtos_kernel_sched.ready)
+#define rtos_kernel_boostedMask (rtos_kernel_sched.boosted)
+#define rtos_needSwitch         (rtos_kernel_sched.needSwitch)
 
 
 /*
@@ -155,6 +171,22 @@ extern rtos_panicRecord_t rtos_panicRecord;
 /** Called by rtos_init: latch and clear the persistent record. */
 void rtos_kernel_panicInit(void);
 
+/** CPU load in percent from the idle time and the total time of an interval. idle * 100
+    must not overflow the run time type (it did on the AVR beyond 42.9 M counts, 172 s of
+    idle time at 16 MHz), so both are halved together until total * 100 fits: at most 7
+    shifts for 32 bit counts, a bounded loop. */
+static inline uint8_t rtos_kernel_loadPercent(rtos_runtime_t idle, rtos_runtime_t total)
+{
+    if(total == 0  ||  idle >= total)
+        return 0;
+    while(total > (rtos_runtime_t)-1 / 100u)
+    {
+        total >>= 1;
+        idle >>= 1;
+    }
+    return (uint8_t)(100u - (uint8_t)((idle * 100u) / total));
+}
+
 /** Ticks until the next timed wake up or software timer expiry; RTOS_FOREVER if none.
     Interrupts disabled. Used by tickless idle. */
 rtos_tick_t rtos_kernel_ticksToNextWake(void);
@@ -193,6 +225,27 @@ void rtos_kernel_taskExit(void) __attribute__((noreturn));
     run time), out of line; the caller then calls rtos_port_switchContext itself. */
 void rtos_kernel_isrPrepareSwitch(uint8_t hi);
 
+/** Set a task's effective priority and keep rtos_kernel_boostedMask in step: the bit
+    is set exactly while effPrio differs from prio. Interrupts disabled. */
+RTOS_KERNEL_HOT_INLINE void rtos_kernel_setEffPrio(rtos_tcb_t *pT, uint8_t effPrio)
+{
+    pT->effPrio = effPrio;
+    if(effPrio != pT->prio)
+        rtos_kernel_boostedMask |= pT->bit;
+    else
+        rtos_kernel_boostedMask &= (rtos_taskmask_t)~pT->bit;
+}
+
+/** The slow paths of the scheduler and the interrupt tail for the moments when a ready
+    task is boosted by a mutex ceiling (rtos_kernel_boostedMask & rtos_kernel_readyMask
+    is not 0): the next task is then the highest effective priority among the ready
+    tasks, not the highest ready bit. Out of line and cold, and the inline callers return
+    right after calling them, so that the hot path neither pays a call nor keeps anything
+    alive across one. The interrupt variant does the switch itself, one frame deeper than
+    the hot path. Interrupts disabled. */
+void rtos_kernel_scheduleBoosted(void) __attribute__((noinline, cold));
+void rtos_kernel_isrTailBoosted(void) __attribute__((noinline, cold));
+
 /** Body of rtos_isrTail for a port that calls it from its own interrupt epilogue without
     another call level: the switch is called from the caller's frame, so a task switched
     out of an interrupt leaves one frame less on its stack. */
@@ -200,12 +253,19 @@ RTOS_KERNEL_HOT_INLINE void rtos_kernel_isrTailInline(void)
 {
     if(rtos_needSwitch)
     {
-        const uint8_t hi = rtos_kernel_highestBit(rtos_kernel_readyMask);
         rtos_needSwitch = 0;
-        if(hi > rtos_pCurrent->effPrio)
+        if((rtos_kernel_readyMask & rtos_kernel_boostedMask) != 0)
         {
-            rtos_kernel_isrPrepareSwitch(hi);
-            rtos_port_switchContext();
+            rtos_kernel_isrTailBoosted();
+            return;
+        }
+        {
+            const uint8_t hi = rtos_kernel_highestBit(rtos_kernel_readyMask);
+            if(hi > rtos_pCurrent->effPrio)
+            {
+                rtos_kernel_isrPrepareSwitch(hi);
+                rtos_port_switchContext();
+            }
         }
     }
 }

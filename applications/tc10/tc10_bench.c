@@ -134,7 +134,7 @@ static volatile uint8_t _probeArmed = 0;
 static stat_t _entry;                       /* probe counts */
 static stat_t _wakeSemStat, _wakeNotifyStat;    /* cycles */
 static stat_t _switchStat[4];               /* cycles per switch */
-static uint32_t _api[12];                   /* cycles per call pair */
+static uint32_t _api[14];                   /* cycles per call pair */
 static uint32_t _readCost;                  /* cycles of reading the counter itself */
 
 
@@ -315,6 +315,10 @@ static void benchApi(void)
 #endif
     MEASURE(10, { rtos_postEvents(TASK_LOW, 1); (void)rtos_waitEvents(1, RTOS_WAIT_ANY, RTOS_NO_WAIT); });
     MEASURE(11, (void)rtos_getStackFree(TASK_HIGH));
+    MEASURE(12, (void)rtos_getTimeUs());
+#if RTOS_CFG_RUNTIME_STATS
+    MEASURE(13, (void)rtos_getCpuLoad());
+#endif
 }
 
 
@@ -342,11 +346,12 @@ static void putStackUsed(const char *name, uint8_t task)
 
 static void report(void)
 {
-    static const char * const apiName[12] =
+    static const char * const apiName[14] =
     {
         "critical section", "getTick", "sem give+take", "notify set+wait",
         "mutex lock+unlock", "queue send+recv", "mbox post+fetch", "pool alloc+free",
         "evgroup set+wait", "timer start+stop", "events post+wait", "getStackFree",
+        "getTimeUs", "getCpuLoad",
     };
     static const char * const switchName[4] = { "sem", "notify", "queue", "events" };
     unsigned i;
@@ -365,7 +370,7 @@ static void report(void)
     uart_puts(" (cycles; 1 cycle = ");        uart_putU32(NS_OF_CYCLES(1000) );
     uart_puts(" ps)\r\n  api (one call pair, no switch, min of "); uart_putU32(API_ITERS);
     uart_puts("):\r\n");
-    for(i=0; i<12; ++i)
+    for(i=0; i<14; ++i)
     {
         if(_api[i] == 0  &&  i != 0)
             continue;

@@ -108,8 +108,14 @@ $(HOST_BUILD)/%: test/%.c $(HOST_KERNEL) $(wildcard kernel/*.h) $(wildcard port/
 	@mkdir -p $(HOST_BUILD)
 	$(HOSTCC) $(HOST_FLAGS) -Itest/$* -Itest -o $@ $< $(HOST_KERNEL)
 
+# A test passes when it exits 0 and its last line starts with PASS; anything else (a
+# FAIL line, an assertion, a sanitizer abort, a crash) fails the target. The output is
+# kept in <test>.log and its last lines are shown on failure.
 host-test: $(HOST_TESTS)
-	@for t in $(HOST_TESTS); do echo "== $$t"; ASAN_OPTIONS=detect_stack_use_after_return=0 $$t | tail -1 || exit 1; done
+	@fail=0; for t in $(HOST_TESTS); do echo "== $$t"; \
+	  ASAN_OPTIONS=detect_stack_use_after_return=0 $$t > $$t.log 2>&1; st=$$?; \
+	  if [ $$st -eq 0 ] && tail -1 $$t.log | grep -q '^PASS'; then tail -1 $$t.log; \
+	  else echo "FAIL: $$t (exit status $$st)"; tail -5 $$t.log; fail=1; fi; done; exit $$fail
 
 # Everything: host tests, every tc application in simavr for the AVR boards and on an
 # ESP32 if one is connected. See tools/test_all.sh for the variables it takes.

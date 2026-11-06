@@ -110,11 +110,22 @@ bool amp_receive(amp_msg_t *pMsg, rtos_tick_t timeout)
         const uint16_t head = _pRx->head;
         if(head != _pRx->tail)
         {
+            const uint16_t next = (uint16_t)((head + 1u) % AMP_RING_SLOTS);
             barrier();
             *pMsg = _pRx->slot[head];
             barrier();
-            _pRx->head = (uint16_t)((head + 1u) % AMP_RING_SLOTS);
+            _pRx->head = next;
+            /* More in the ring: pass the wake-up on to the next receiver. The other core
+               signals once per message, but signals that arrive before the interrupt is
+               taken merge into one interrupt and one give of the binary semaphore, which
+               wakes one receiver; without this a second waiting receiver would sleep
+               until the next message or until the first one comes back. The give is a
+               no-op (counted as lost) when nobody waits; a receiver woken for a message
+               already taken finds the ring empty and waits again. */
+            const bool more = next != _pRx->tail;
             rtos_port_exitCritical(cs);
+            if(more)
+                rtos_semGive(&_semRx);          /* task variant: switches if the woken one is higher */
             return true;
         }
         rtos_port_exitCritical(cs);

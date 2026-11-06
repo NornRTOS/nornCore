@@ -167,6 +167,8 @@ static void checkInvariants(void)
             CHECK(pT->effPrio == _mutex.ceiling, pT->effPrio, _mutex.ceiling);
         else
             CHECK(pT->effPrio == pT->prio, pT->effPrio, pT->prio);
+        CHECK(((rtos_kernel_boostedMask & pT->bit) != 0) == (pT->effPrio != pT->prio),
+              rtos_kernel_boostedMask, pT->effPrio);
     }
     CHECK((_sem.waiters & ready) == 0, _sem.waiters, ready);
     CHECK((_mutex.waiters & ready) == 0, _mutex.waiters, ready);

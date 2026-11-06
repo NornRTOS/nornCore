@@ -160,22 +160,23 @@ RTOS_ISR(RTOS_PORT_TICK_VECT)
 }
 
 
+#if (PRESCALER * 1000000ul) % F_CPU != 0
+# error rtos_getTimeUs needs a whole number of microseconds per timer count (F_CPU of 16, 8, 4, 2 or 1 MHz)
+#endif
+
 uint32_t rtos_getTimeUs(void)
 {
-    rtos_tick_t t;
-    uint16_t cnt;
+    /* Built on the run time counter, not on the tick: 32 bits of timer counts that the
+       tick ISR keeps in every configuration, so the result does not jump back when 16
+       bit ticks wrap (every 65.5 s at 1 kHz). A count is a whole number of microseconds,
+       so the product wraps at 2^32 us like the result type, without a jump, and costs a
+       shift instead of the 32 bit multiplication by the tick period. */
+    rtos_port_runtime_t c;
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
-    t = rtos_getTick();
-    cnt = RTOS_PORT_TCNTn;
-    if(RTOS_PORT_TIFRn & _BV(RTOS_PORT_OCFnA))
-    {
-        /* A tick is pending but not yet counted. */
-        ++ t;
-        cnt = RTOS_PORT_TCNTn;
-    }
+    c = rtos_port_getRunTimeCounter();
     rtos_port_exitCritical(cs);
-    return (uint32_t)t * US_PER_TICK + (uint32_t)cnt * US_PER_COUNT;
+    return (uint32_t)c * US_PER_COUNT;
 }
 
 

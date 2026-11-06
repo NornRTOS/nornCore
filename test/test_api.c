@@ -373,9 +373,24 @@ void rtos_assertFailed(const char *file, uint16_t line)
     exit(2);
 }
 
+/* The CPU load arithmetic with 32 bit run time counts (the host's type, as on the AVR):
+   idle * 100 overflowed beyond 42.9 M counts (audit F10). */
+static void loadChecks(void)
+{
+    CHECK(sizeof(rtos_runtime_t) == 4);
+    CHECK(rtos_kernel_loadPercent(0, 0) == 0);
+    CHECK(rtos_kernel_loadPercent(10, 10) == 0);
+    CHECK(rtos_kernel_loadPercent(25, 100) == 75);
+    CHECK(rtos_kernel_loadPercent(50000000ul, 100000000ul) == 50);
+    CHECK(rtos_kernel_loadPercent(1000000000ul, 4000000000ul) == 75);
+    CHECK(rtos_kernel_loadPercent(0, 0xFFFFFFFFul) == 100);
+    CHECK(rtos_kernel_loadPercent(0xFFFFFFFEul, 0xFFFFFFFFul) == 0);
+}
+
 int main(void)
 {
     rtos_init();
+    loadChecks();
     rtos_createTask(T1, task1, NULL, _stack1, sizeof(_stack1));
     rtos_createTask(T2, task2, NULL, _stack2, sizeof(_stack2));
     rtos_start();

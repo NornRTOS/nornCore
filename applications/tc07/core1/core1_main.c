@@ -3,6 +3,7 @@
  * Test case 7, the APP CPU side: a worker task that answers every request from core 0
  * with the product of its operands plus the sequence number, and a periodic task that
  * keeps its own tick count so core 0 can see that this kernel instance ticks on its own.
+ * A burst request (w[0] with 0xB in the top nibble) gets two replies back to back.
  * No UART here: core 0 owns the console.
  */
 
@@ -35,6 +36,16 @@ static void taskWorker(void *arg)
         if(amp_receive(&m, RTOS_FOREVER))
         {
             amp_msg_t r;
+            if((m.w[0] & 0xF0000000ul) == 0xB0000000ul)
+            {
+                /* A burst request of phase 2: two replies back to back. */
+                r = m;
+                while(!amp_send(&r))
+                    rtos_delay(1);
+                while(!amp_send(&r))
+                    rtos_delay(1);
+                continue;
+            }
             r.w[0] = m.w[0];                    /* sequence */
             r.w[1] = m.w[1] * m.w[2] + m.w[0];  /* the answer */
             r.w[2] = _beats;                    /* core 1's own time */

@@ -132,6 +132,8 @@ void rtos_port_wdtKick(void)
     _wdtCounter = 0;
 }
 
+static volatile uint32_t _hostTicks;
+
 void rtos_host_tick(void)
 {
     if(_wdtTimeout != 0  &&  ++_wdtCounter > _wdtTimeout)
@@ -139,15 +141,18 @@ void rtos_host_tick(void)
         fprintf(stderr, "host watchdog expired\n");
         rtos_port_reset();
     }
+    ++ _hostTicks;
     rtos_host_simulateIsr(rtos_tickFromIsr);
 }
 
+/* Run time and microseconds come from the port's own 32 bit tick count, as on the AVR from
+   its timer count: with 16 bit ticks the kernel's counter wraps every 65536 ticks. */
 rtos_port_runtime_t rtos_port_getRunTimeCounter(void)
 {
-    return rtos_tickCount;
+    return _hostTicks;
 }
 
 uint32_t rtos_getTimeUs(void)
 {
-    return rtos_getTick() * (1000000ul / RTOS_CFG_TICK_HZ);
+    return _hostTicks * (1000000ul / RTOS_CFG_TICK_HZ);
 }

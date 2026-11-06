@@ -173,9 +173,57 @@ void rtos_assertFailed(const char *file, uint16_t line)
     exit(2);
 }
 
+/* Pools the free list links must not assume alignment for (audit F3): an odd block size on
+   storage that starts one byte past a pointer boundary, built under UBSan; and a pool
+   above 64 KiB whose last blocks have offsets a 16 bit offset check truncates (audit
+   F7). Both before the scheduler runs, through the ISR variants. */
+static union { uint8_t bytes[1 + 9 * 3]; void *align; } _odd;
+static uint8_t _large[80000];
+
+static void unitChecks(void)
+{
+    rtos_pool_t pool;
+    void *a, *b, *c;
+    unsigned i;
+
+    rtos_poolInit(&pool, _odd.bytes + 1, 9, 3);
+    a = rtos_poolAllocFromIsr(&pool); b = rtos_poolAllocFromIsr(&pool); c = rtos_poolAllocFromIsr(&pool);
+    if(a != _odd.bytes + 1  ||  b != _odd.bytes + 10  ||  c != _odd.bytes + 19
+       ||  rtos_poolAllocFromIsr(&pool) != NULL)
+    {
+        printf("FAIL: odd pool blocks %p %p %p\n", a, b, c);
+        exit(1);
+    }
+    memset(a, 0x11, 9); memset(b, 0x22, 9); memset(c, 0x33, 9);
+    rtos_poolFreeFromIsr(&pool, b);
+    rtos_poolFreeFromIsr(&pool, a);
+    if(rtos_poolAllocFromIsr(&pool) != a  ||  rtos_poolAllocFromIsr(&pool) != b
+       ||  ((uint8_t *)c)[8] != 0x33  ||  rtos_poolFreeCount(&pool) != 0)
+    {
+        printf("FAIL: odd pool reuse\n");
+        exit(1);
+    }
+
+    rtos_poolInit(&pool, _large, 400, 200);
+    for(i=0; i<166; ++i)
+        a = rtos_poolAllocFromIsr(&pool);
+    if((uint8_t *)a != _large + 165 * 400)
+    {
+        printf("FAIL: large pool block 166 at offset %ld\n", (long)((uint8_t *)a - _large));
+        exit(1);
+    }
+    rtos_poolFreeFromIsr(&pool, a);              /* offset 66000: panicked when truncated */
+    if(rtos_poolFreeCount(&pool) != 200 - 165)
+    {
+        printf("FAIL: large pool free count %u\n", rtos_poolFreeCount(&pool));
+        exit(1);
+    }
+}
+
 int main(void)
 {
     rtos_init();
+    unitChecks();
     rtos_poolInit(&_pool, _poolStorage, BLOCK_SIZE, NUM_BLOCKS);
     rtos_createTask(T1, task1, NULL, _stack1, sizeof(_stack1));
     rtos_createTask(T2, task2, NULL, _stack2, sizeof(_stack2));

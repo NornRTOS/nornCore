@@ -132,7 +132,7 @@ void rtos_mutexLock(rtos_mutex_t *pMutex)
         pMutex->owner = pCur->prio;
         pMutex->savedPrio = pCur->effPrio;
         if(pMutex->ceiling > pCur->effPrio)
-            pCur->effPrio = pMutex->ceiling;
+            rtos_kernel_setEffPrio(pCur, pMutex->ceiling);
     }
     else
     {
@@ -172,7 +172,7 @@ void rtos_mutexUnlock(rtos_mutex_t *pMutex)
 
     /* LIFO unlock order is required when holding several mutexes. */
     RTOS_ASSERT(pMutex->savedPrio <= pCur->effPrio);
-    pCur->effPrio = pMutex->savedPrio;
+    rtos_kernel_setEffPrio(pCur, pMutex->savedPrio);
 
     if(pMutex->waiters != 0)
     {
@@ -182,7 +182,7 @@ void rtos_mutexUnlock(rtos_mutex_t *pMutex)
         pMutex->owner = pNext->prio;
         pMutex->savedPrio = pNext->effPrio;
         if(pMutex->ceiling > pNext->effPrio)
-            pNext->effPrio = pMutex->ceiling;
+            rtos_kernel_setEffPrio(pNext, pMutex->ceiling);
     }
     else
         pMutex->owner = RTOS_NO_TASK;
