@@ -433,6 +433,9 @@ nothing, and a heavy parallel build on the host can even fail their latency limi
 ## Applications (applications/)
 
     hello  bring-up without the scheduler: banner, one line per second, LED, UART echo
+    blink  the smallest running nornOS: one task toggles the LED every 500 ms (blue LED
+           on the ESP32 devkit, pin 13 on the AVR boards), everything else off. Image:
+           esp32 6089 text / 1500 data+bss, mega2560 2656 / 319, uno 2514 / 319 bytes
     tc01   periodic task, events, semaphore from an ISR, ceiling mutex, stack check
     tc04   timing: context switch, interrupt latency, periodic jitter
     tc05   panic, reset and recovery: application panic, stack overflow, late task,
