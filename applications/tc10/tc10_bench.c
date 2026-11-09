@@ -20,6 +20,12 @@
  *              sum of the two minima: the best case a driver can plan with.
  *   ram        sizes of the TCB and the objects, the smallest allowed stack, and how much
  *              stack each task of this program used (fill pattern high water mark).
+ *   ceiling held  the api row "sem give+take, ceiling held" and the isr row "isr->task
+ *              notify, ceiling held" repeat two measurements while taskLow holds a mutex
+ *              whose ceiling is above its priority, i.e. while the running task is
+ *              boosted: the scheduler's decision then involves the boosted mask. The
+ *              isr row is taken in a 300 ms window in which taskLow spins holding the
+ *              mutex, so the probes find it running (cpuLoad rises accordingly).
  *
  * The numbers are the point; the PASS limits only catch gross regressions. The README
  * carries the figures per board.
@@ -113,6 +119,8 @@ static uint8_t _stackLow[STACK_SIZE];
 static rtos_sem_t _sem = RTOS_SEM_INIT(0);
 static rtos_sem_t _wakeSem = RTOS_SEM_INIT(0);
 static rtos_mutex_t _mutex = RTOS_MUTEX_INIT(TASK_LOW);
+static rtos_mutex_t _ceil = RTOS_MUTEX_INIT(TASK_HIGH);    /* boosts taskLow while held */
+static volatile uint8_t _ceilHeld = 0;      /* taskLow spins holding _ceil: isr row */
 static uint8_t _qStorage[4];
 static rtos_queue_t _queue = RTOS_QUEUE_INIT(_qStorage, 1, 4);
 static uint8_t _mbStorage[2];
@@ -133,8 +141,9 @@ static volatile uint8_t _probeArmed = 0;
 
 static stat_t _entry;                       /* probe counts */
 static stat_t _wakeSemStat, _wakeNotifyStat;    /* cycles */
+static stat_t _wakeCeilStat;                /* isr->task while the ceiling is held */
 static stat_t _switchStat[4];               /* cycles per switch */
-static uint32_t _api[14];                   /* cycles per call pair */
+static uint32_t _api[15];                   /* cycles per call pair */
 static uint32_t _readCost;                  /* cycles of reading the counter itself */
 
 
@@ -198,13 +207,13 @@ static void taskWake(void *arg)
         {
             (void)rtos_semTake(&_wakeSem, RTOS_FOREVER);
             dt = CYC(board_cycles() - _wakeStamp);
-            statAdd(&_wakeSemStat, dt);
+            statAdd(_ceilHeld ? &_wakeCeilStat : &_wakeSemStat, dt);
         }
         else
         {
             (void)rtos_notifyTake(RTOS_FOREVER);
             dt = CYC(board_cycles() - _wakeStamp);
-            statAdd(&_wakeNotifyStat, dt);
+            statAdd(_ceilHeld ? &_wakeCeilStat : &_wakeNotifyStat, dt);
         }
         if(++n == WAKE_ROUNDS)
             _wakeMode = MODE_NOTIFY;    /* a give that lands in between is harmless */
@@ -319,6 +328,32 @@ static void benchApi(void)
 #if RTOS_CFG_RUNTIME_STATS
     MEASURE(13, (void)rtos_getCpuLoad());
 #endif
+    /* The same give+take as row 2 while we are boosted by a ceiling: the give's
+       scheduling decision sees the running task in the boosted mask. */
+    rtos_mutexLock(&_ceil);
+    MEASURE(14, { rtos_semGive(&_sem); (void)rtos_semTake(&_sem, RTOS_NO_WAIT); });
+    rtos_mutexUnlock(&_ceil);
+}
+
+
+/** isr->task while the running task is boosted: once the probes have moved to the
+    notification and a few rounds are in, hold _ceil and spin for 300 ms so that every
+    probe interrupts a boosted running task and the interrupt tail switches away from
+    it to taskWake. */
+static void benchIsrCeil(void)
+{
+    rtos_tick_t t0;
+
+    while(_wakeMode != MODE_NOTIFY  ||  _wakeNotifyStat.n < 100u)
+        rtos_delay(RTOS_MS(10));
+    statInit(&_wakeCeilStat);
+    rtos_mutexLock(&_ceil);
+    _ceilHeld = 1;
+    t0 = rtos_getTick();
+    while((rtos_tick_t)(rtos_getTick() - t0) < RTOS_MS(300))
+        ;
+    _ceilHeld = 0;
+    rtos_mutexUnlock(&_ceil);
 }
 
 
@@ -346,12 +381,12 @@ static void putStackUsed(const char *name, uint8_t task)
 
 static void report(void)
 {
-    static const char * const apiName[14] =
+    static const char * const apiName[15] =
     {
         "critical section", "getTick", "sem give+take", "notify set+wait",
         "mutex lock+unlock", "queue send+recv", "mbox post+fetch", "pool alloc+free",
         "evgroup set+wait", "timer start+stop", "events post+wait", "getStackFree",
-        "getTimeUs", "getCpuLoad",
+        "getTimeUs", "getCpuLoad", "sem give+take, ceiling held",
     };
     static const char * const switchName[4] = { "sem", "notify", "queue", "events" };
     unsigned i;
@@ -370,7 +405,7 @@ static void report(void)
     uart_puts(" (cycles; 1 cycle = ");        uart_putU32(NS_OF_CYCLES(1000) );
     uart_puts(" ps)\r\n  api (one call pair, no switch, min of "); uart_putU32(API_ITERS);
     uart_puts("):\r\n");
-    for(i=0; i<14; ++i)
+    for(i=0; i<15; ++i)
     {
         if(_api[i] == 0  &&  i != 0)
             continue;
@@ -396,6 +431,7 @@ static void report(void)
     putStat("    entry:            ", &entry, true);
     putStat("    isr->task sem:    ", &_wakeSemStat, false);
     putStat("    isr->task notify: ", &_wakeNotifyStat, false);
+    putStat("    isr->task notify, ceiling held: ", &_wakeCeilStat, false);
     hwToTask = NS_OF_HIRES(entry.min) + NS_OF_CYCLES(_wakeNotifyStat.min);
     uart_puts("    hw->task best:    "); uart_putU32(hwToTask); uart_puts(" ns\r\n");
     uart_puts("  ram (bytes):\r\n    tcb ");   uart_putU32((uint32_t)sizeof(rtos_tcb_t));
@@ -426,6 +462,7 @@ static void report(void)
     tc_expectRange("isrTaskSemN", _wakeSemStat.n, WAKE_ROUNDS, WAKE_ROUNDS);
     tc_expectRange("isrTaskNotifyN", _wakeNotifyStat.n, 100, 0xFFFFFFFFul);
     tc_expectRange("isrTaskMaxNs", NS_OF_CYCLES(_wakeNotifyStat.max), 1, LIMIT_ISR_TASK_NS);
+    tc_expectRange("isrTaskCeilN", _wakeCeilStat.n, 50, 0xFFFFFFFFul);
     tc_expectRange("probes", entry.n, (uint32_t)(ms * 1000ul / PROBE_AVG_US) * 9ul / 10ul,
                    (uint32_t)(ms * 1000ul / PROBE_AVG_US) * 11ul / 10ul);
 #if RTOS_CFG_STACK_CHECK
@@ -450,6 +487,7 @@ static void taskLow(void *arg)
     rtos_delay(RTOS_MS(50));            /* let the others settle */
     benchSwitch();
     benchApi();
+    benchIsrCeil();
     for(;;)
     {
         rtos_delay(RTOS_MS(100));

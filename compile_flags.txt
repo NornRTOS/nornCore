@@ -1,0 +1,2 @@
+-std=c99
+-I/home/andrek/dev/gits/nornRTOS/modules/nornCore/kernel

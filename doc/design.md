@@ -38,10 +38,28 @@ The ready mask is indexed by base priority, so a boosted task that is ready but 
 running (an owner that blocked while holding, or a waiter that was just handed the
 mutex) is not found by the highest ready bit. The kernel keeps a second mask of the
 tasks whose effective priority differs from their base priority (rtos_kernel_boostedMask,
-maintained by rtos_kernel_setEffPrio); the task picker (rtos_kernel_pickReady, shared by
-the scheduler and the interrupt tail) scans those few tasks for the highest effective
-priority only while one of them is ready, and otherwise costs one mask test on top of
-the highest bit lookup. The preemption rule compares effective priorities on both sides.
+maintained by rtos_kernel_setEffPrio); the task picker (pickBoosted in rtos_kernel.c,
+shared by the scheduler and the interrupt tail) scans those few tasks only while one of
+them other than the running task is ready, and otherwise costs one mask test on top of
+the highest bit lookup. The running task's own boost is covered by the fast path's
+comparison, so a task that merely holds a mutex schedules at full speed (before this
+exclusion the Mega paid about 190 cycles on every semaphore give made under a mutex).
+The scan is one iteration per ready boosted task; nested mutexes on one task are one
+bit.
+
+The scheduling order is a contract, not an artefact of that scan: tasks are ordered by
+the key (effective priority, boosted, base priority), compared lexicographically, where
+boosted means the effective priority differs from the base priority. The picker takes
+the greatest key, and a ready task preempts the running one only if its key is strictly
+greater. So the highest effective priority wins; at an equal effective priority c the
+owner raised to the ceiling c runs before the task whose base priority is c (a user of
+the mutex, which would block on it, and the protocol promises that never happens with a
+correct ceiling), and that owner's wake-up preempts such a task; and two owners boosted
+to the same ceiling, which only happens when one of them blocked while holding, run in
+base priority order. The base priority is unique, so the order is total. On the fast
+path, where no ready task but possibly the current one is boosted, the highest ready
+bit above the current task's effective priority is the same order. test/test_tie.c
+checks every case against the trace.
 
 Critical sections are short interrupt masks with the previous state restored, nestable.
 There is no kernel lock besides them; every kernel operation runs with interrupts masked
@@ -106,10 +124,64 @@ format, the PLL and a second kernel instance on the other core (AMP) with a shar
 memory link. The host port runs the kernel on Linux ucontext for deterministic unit tests
 with simulated interrupts, which is where every primitive is specified by its trace.
 
+## Task life cycle
+
+The states are derived from the TCB, not stored: no byte and no store on the hot path.
+This is the table the kernel implements, and the contract a future dynamic task API
+builds on.
+
+| State | Predicate | Entered by | Left by |
+|---|---|---|---|
+| UNUSED | `taskFunc == NULL`; the TCB is in its initial state (rtos_kernel_tcbReset) | rtos_init, a reap | rtos_createTask |
+| READY | bit in the ready mask, not the running task | create, wake-up, preemption | pick, block, suspend |
+| RUNNING | `rtos_pCurrent` (its bit stays in the ready mask) | pick | block, preemption, return |
+| BLOCKED | bit not in the ready mask, `waitKind` says on what, RTOS_TF_IN_TIMED_LIST says if a timeout runs | a blocking call | wake-up, timeout |
+| TERMINATED | `waitKind == RTOS_WAIT_TERMINATED`, bit not in the ready mask | the task function returning (rtos_kernel_taskExit) | a reap, from another context |
+
+Suspended is a modifier on READY and BLOCKED, not a state: RTOS_TF_SUSPENDED keeps the
+task off the ready mask and RTOS_TF_READY_PENDING remembers that a wake-up arrived
+meanwhile. rtos_getTaskInfo reports it as RTOS_TASK_SUSPENDED, except for a terminated
+task, which is final either way.
+
+Rules, each checked by test/test_lifecycle.c:
+
+* A terminated task is deaf: nothing makes it ready again. Every wake-up path tests the
+  wait kind (events, event groups), a flag the task no longer has (notifications), a list
+  it is no longer in (timeouts, waiter masks) or RTOS_TF_READY_PENDING (resume), and
+  rtos_kernel_taskExit never calls rtos_kernel_blockCurrent, so the wait kind is never
+  reset. Events and notifications posted at it accumulate harmlessly;
+  rtos_broadcastEvents and the stack monitor still visit it; a watchdog monitor on it
+  fires, as it should.
+* A task must not return while holding a mutex: the owner would stay recorded for ever
+  and every later lock would wait with no deadlock panic, since the detector only
+  follows tasks blocked on mutexes. rtos_kernel_taskExit checks `effPrio == prio`
+  (RTOS_PANIC_ARGUMENT), which catches every mutex with a ceiling above the task's
+  priority; a ceiling equal to it is invisible without a per task count of held mutexes,
+  which is the first thing to add when deletion arrives.
+* UNUSED means reset, not just `taskFunc == NULL`. rtos_createTask fills only what it
+  owns (function, argument, stack, context) and relies on the rest being in the initial
+  state, so a reused slot that kept pending events, a suspended flag or a raised
+  effective priority would hand them to the new task. rtos_kernel_tcbReset is the one
+  place that produces the initial state; rtos_init runs it over every slot and a reap
+  runs it over a terminated task.
+* The stack of a terminated task is in use until another context runs. The task
+  returns into rtos_kernel_taskExit on its own stack, and the switch away from it saves
+  the context there (pushes on the AVR, the window spill on the Xtensa). So a task only
+  ever terminates itself, and the reap, the reset and the freeing of the stack happen in
+  a different context, after the switch: the idle task or the creator, never the dying
+  task, and never a task that is READY, BLOCKED or RUNNING. The host port also has to
+  release the ucontext and the stack it allocated in rtos_port_initStack.
+* Creating a task while the scheduler runs needs a critical section around
+  rtos_createTask, a schedule after it from task context (the new task may be the
+  highest) and the switch request from an ISR; the stack fill loop under
+  RTOS_CFG_STACK_CHECK makes creation from an ISR a bad idea. rtos_createTask itself
+  stays as it is; the run-time variant wraps it.
+
 ## What is deliberately absent
 
-Time slicing (see above), dynamic task creation and deletion (static systems do not need
-them, and deletion is the source of most use-after-free bugs in kernels), priority
+Time slicing (see above), dynamic task creation and deletion at run time (static systems
+do not need them, and deletion is the source of most use-after-free bugs in kernels; the
+life cycle above is the preparation and doc/dynamic_tasks_plan.md the remaining steps), priority
 inheritance (the ceiling protocol is simpler and has better bounds), SMP (the two ESP32
 cores run two independent kernels instead: no locks in the scheduler, no cache
 coherence questions, and a message link that is as fast as a shared memory copy).

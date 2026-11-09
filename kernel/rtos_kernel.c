@@ -185,8 +185,14 @@ RTOS_KERNEL_HOT_INLINE void scheduleInline(void)
     rtos_needSwitch = 0;
 
     /* The ready mask is indexed by base priority. While a task boosted by a mutex
-       ceiling is ready the pick must look at effective priorities: out of line. */
-    if((_readyMask & _boostedMask) != 0)
+       ceiling is ready the pick must look at effective priorities: out of line. The
+       current task's own boost does not count: it is already in the comparison below
+       (hi > effPrio), and it would otherwise send every scheduling decision taken
+       while holding a mutex down the slow path. The test of the boosted mask alone
+       comes first so that the common case, no ceiling held anywhere, pays one compare
+       and no mask arithmetic (measured: it is one cycle cheaper than the plain
+       ready & boosted test on the Mega). */
+    if(_boostedMask != 0  &&  (_readyMask & _boostedMask & (rtos_taskmask_t)~pCur->bit) != 0)
     {
         rtos_kernel_scheduleBoosted();
         return;
@@ -203,24 +209,50 @@ RTOS_KERNEL_HOT_INLINE void scheduleInline(void)
 
 
 /**
- * The ready task to run while a boosted task is ready: the highest effective priority,
- * the highest ready bit on a tie. Interrupts disabled.
+ * The scheduling order: true if task \a pA ranks above task \a pB. Tasks are ordered by
+ * the key (effPrio, boosted, prio), compared lexicographically, where boosted means that
+ * the effective priority differs from the base priority, i.e. the task holds a mutex
+ * with a ceiling above its own priority. The highest effective priority wins; at an
+ * equal effective priority c a boosted owner ranks above the task whose base priority is
+ * c (that task is a user of the mutex and would block on it, which the ceiling protocol
+ * promises never happens), and two boosted tasks at one ceiling rank by base priority.
+ * The base priority is unique, so the order is total and no two tasks ever tie.
+ *   Only the slow paths use this: the fast path is taken when no ready task but possibly
+ * the current one is boosted, and there "highest ready bit above the current effective
+ * priority" is the same order (a boosted current task wins its tie with the task at the
+ * ceiling, which the strict comparison gives for free).
+ */
+static inline bool ranksAbove(const rtos_tcb_t *pA, const rtos_tcb_t *pB)
+{
+    if(pA->effPrio != pB->effPrio)
+        return pA->effPrio > pB->effPrio;
+    {
+        const bool aBoosted = pA->effPrio != pA->prio;
+        const bool bBoosted = pB->effPrio != pB->prio;
+        if(aBoosted != bBoosted)
+            return aBoosted;
+    }
+    return pA->prio > pB->prio;
+}
+
+
+/**
+ * The ready task to run while a boosted task is ready: the greatest key (ranksAbove)
+ * among the highest ready bit and the ready boosted tasks. Every other ready task has
+ * its base priority as effective priority and is below the highest ready bit in every
+ * component of the key. Interrupts disabled. The cost is one iteration per ready boosted
+ * task; nested mutexes on one task are one bit.
  */
 static rtos_tcb_t *pickBoosted(void)
 {
-    const uint8_t hi = highestBit(_readyMask);
-    rtos_tcb_t *pBest = &rtos_tcbAry[hi];
-    uint8_t eff = hi;
+    rtos_tcb_t *pBest = &rtos_tcbAry[highestBit(_readyMask)];
     rtos_taskmask_t boosted = _readyMask & _boostedMask;
 
     do
     {
         rtos_tcb_t * const pT = &rtos_tcbAry[highestBit(boosted)];
-        if(pT->effPrio > eff)
-        {
+        if(ranksAbove(pT, pBest))
             pBest = pT;
-            eff = pT->effPrio;
-        }
         boosted &= (rtos_taskmask_t)~pT->bit;
     }
     while(boosted != 0);
@@ -233,7 +265,7 @@ void rtos_kernel_scheduleBoosted(void)
     rtos_tcb_t * const pCur = rtos_pCurrent;
     rtos_tcb_t * const pNext = pickBoosted();
 
-    if((_readyMask & pCur->bit) == 0  ||  pNext->effPrio > pCur->effPrio)
+    if((_readyMask & pCur->bit) == 0  ||  ranksAbove(pNext, pCur))
         switchTo(pNext);
 }
 
@@ -242,7 +274,7 @@ void rtos_kernel_isrTailBoosted(void)
 {
     rtos_tcb_t * const pNext = pickBoosted();
 
-    if(pNext->effPrio > rtos_pCurrent->effPrio)
+    if(ranksAbove(pNext, rtos_pCurrent))
     {
         rtos_kernel_isrPrepareSwitch(pNext->prio);
         rtos_port_switchContext();
@@ -391,9 +423,20 @@ void *rtos_kernel_taskStartArg(void)
 
 void rtos_kernel_taskExit(void)
 {
-    /* The task function returned. Terminate the task: block forever. */
+    /* The task function returned. Terminate the task: off the ready mask for good, and
+       marked so that rtos_getTaskInfo can tell it from a blocked task and nothing can
+       make it ready again (the wait kind is what every wake-up path checks). */
     rtos_tcb_t * const pCur = rtos_pCurrent;
     (void)rtos_port_enterCritical();
+
+    /* A mutex taken into the grave keeps its owner for ever, and a later lock waits with
+       no deadlock panic (the detector follows mutex waits only). Every mutex with a
+       ceiling above the task's priority shows in the effective priority. */
+    RTOS_CHECK(pCur->effPrio == pCur->prio, pCur->prio, pCur->effPrio);
+
+    pCur->waitKind = RTOS_WAIT_TERMINATED;
+    pCur->pWaitObj = NULL;
+    RTOS_TRACE(RTOS_TRACE_BLOCK, pCur->prio, RTOS_WAIT_TERMINATED);
     _readyMask &= (rtos_taskmask_t)~pCur->bit;
     rtos_kernel_schedule();
 
@@ -432,6 +475,41 @@ RTOS_PORT_WEAK void rtos_traceHook(uint8_t event, uint32_t a, uint32_t b)
 #endif
 
 
+void rtos_kernel_tcbReset(uint8_t i)
+{
+    rtos_tcb_t * const pT = &rtos_tcbAry[i];
+
+    pT->ctx = (rtos_port_ctx_t)0;
+    pT->taskFunc = NULL;
+    pT->arg = NULL;
+    pT->pNextTimed = NULL;
+    pT->pWaiters = NULL;
+    pT->pXfer = NULL;
+    pT->wakeAt = 0;
+    pT->periodBase = 0;
+    pT->evtPending = 0;
+    pT->evtWait = 0;
+#if RTOS_CFG_NOTIFY
+    pT->notifyValue = 0;
+#endif
+#if RTOS_CFG_RUNTIME_STATS
+    pT->runTime = 0;
+#endif
+#if RTOS_CFG_STACK_CHECK
+    pT->pStackArea = NULL;
+    pT->stackSize = 0;
+#endif
+    pT->bit = (rtos_taskmask_t)1u << i;
+    pT->prio = i;
+    pT->effPrio = i;
+    _boostedMask &= (rtos_taskmask_t)~pT->bit;
+    pT->flags = 0;
+    pT->cntOverrun = 0;
+    pT->waitKind = RTOS_WAIT_NONE;
+    pT->pWaitObj = NULL;
+}
+
+
 void rtos_initChecked(uint32_t configSignature)
 {
     uint8_t i;
@@ -440,37 +518,7 @@ void rtos_initChecked(uint32_t configSignature)
         rtos_panic(RTOS_PANIC_CONFIG, configSignature, RTOS_CONFIG_SIGNATURE);
 
     for(i=0; i<RTOS_NUM_TASKS; ++i)
-    {
-        rtos_tcb_t * const pT = &rtos_tcbAry[i];
-
-        pT->ctx = (rtos_port_ctx_t)0;
-        pT->taskFunc = NULL;
-        pT->arg = NULL;
-        pT->pNextTimed = NULL;
-        pT->pWaiters = NULL;
-        pT->pXfer = NULL;
-        pT->wakeAt = 0;
-        pT->periodBase = 0;
-        pT->evtPending = 0;
-        pT->evtWait = 0;
-#if RTOS_CFG_NOTIFY
-        pT->notifyValue = 0;
-#endif
-#if RTOS_CFG_RUNTIME_STATS
-        pT->runTime = 0;
-#endif
-#if RTOS_CFG_STACK_CHECK
-        pT->pStackArea = NULL;
-        pT->stackSize = 0;
-#endif
-        pT->bit = (rtos_taskmask_t)1u << i;
-        pT->prio = i;
-        pT->effPrio = i;
-        pT->flags = 0;
-        pT->cntOverrun = 0;
-        pT->waitKind = RTOS_WAIT_NONE;
-        pT->pWaitObj = NULL;
-    }
+        rtos_kernel_tcbReset(i);
     rtos_kernel_panicInit();
     _readyMask = rtos_tcbAry[RTOS_IDLE_TASK].bit;
     _boostedMask = 0;
@@ -887,6 +935,8 @@ bool rtos_getTaskInfo(uint8_t taskId, rtos_taskInfo_t *pInfo)
     cs = rtos_port_enterCritical();
     if(taskId != RTOS_IDLE_TASK  &&  pT->taskFunc == NULL)
         pInfo->state = RTOS_TASK_NONE;
+    else if(pT->waitKind == RTOS_WAIT_TERMINATED)
+        pInfo->state = RTOS_TASK_TERMINATED;    /* before suspended: final either way */
     else if(pT->flags & RTOS_TF_SUSPENDED)
         pInfo->state = RTOS_TASK_SUSPENDED;
     else if(pT == rtos_pCurrent)

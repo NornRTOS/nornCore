@@ -214,6 +214,16 @@ void rtos_kernel_timerTick(rtos_tick_t now);
 rtos_taskmask_t rtos_kernel_getReadyMask(void);
 rtos_tcb_t *rtos_kernel_getTimedHead(void);
 
+/** Put a task control block into its initial state: unused slot (taskFunc NULL), base
+    priority = effective priority = index, no events, flags, overruns, run time or
+    wait. rtos_init runs it over every slot; a future reap runs it over a terminated
+    task once another context runs, which is when the stack is free as well. The task
+    must not be in the ready mask, the timed list or a waiter mask (a terminated task
+    is in none of them; the reap is responsible, nothing is checked here), and the
+    caller holds the critical section. Takes the task id, not the TCB: the id is what
+    the callers have, and deriving it from the pointer is a division on the AVR. */
+void rtos_kernel_tcbReset(uint8_t taskId);
+
 /* Task start in steps, for a port that starts tasks from a frameless stub: the first
    step sets the period base and enables interrupts and returns the function to call,
    the second the argument; the third never returns (called when the function does). */
@@ -237,9 +247,12 @@ RTOS_KERNEL_HOT_INLINE void rtos_kernel_setEffPrio(rtos_tcb_t *pT, uint8_t effPr
 }
 
 /** The slow paths of the scheduler and the interrupt tail for the moments when a ready
-    task is boosted by a mutex ceiling (rtos_kernel_boostedMask & rtos_kernel_readyMask
-    is not 0): the next task is then the highest effective priority among the ready
-    tasks, not the highest ready bit. Out of line and cold, and the inline callers return
+    task other than the current one is boosted by a mutex ceiling (rtos_kernel_boostedMask
+    & rtos_kernel_readyMask minus the current task's bit is not 0): the next task is then
+    the greatest key (effective priority, boosted, base priority) among the ready tasks,
+    not the highest ready bit; see ranksAbove in rtos_kernel.c and doc/design.md. The
+    current task's own boost is handled by the fast path's comparison, so a task that
+    merely holds a mutex pays nothing here. Out of line and cold, and the inline callers return
     right after calling them, so that the hot path neither pays a call nor keeps anything
     alive across one. The interrupt variant does the switch itself, one frame deeper than
     the hot path. Interrupts disabled. */
@@ -253,15 +266,22 @@ RTOS_KERNEL_HOT_INLINE void rtos_kernel_isrTailInline(void)
 {
     if(rtos_needSwitch)
     {
+        rtos_tcb_t * const pCur = rtos_pCurrent;
+
         rtos_needSwitch = 0;
-        if((rtos_kernel_readyMask & rtos_kernel_boostedMask) != 0)
+        /* A boosted ready task other than the current one: slow path. The current
+           task's own boost is in the comparison below. The boosted mask alone is
+           tested first: no ceiling held anywhere is the common case (scheduleInline
+           explains). */
+        if(rtos_kernel_boostedMask != 0
+           &&  (rtos_kernel_readyMask & rtos_kernel_boostedMask & (rtos_taskmask_t)~pCur->bit) != 0)
         {
             rtos_kernel_isrTailBoosted();
             return;
         }
         {
             const uint8_t hi = rtos_kernel_highestBit(rtos_kernel_readyMask);
-            if(hi > rtos_pCurrent->effPrio)
+            if(hi > pCur->effPrio)
             {
                 rtos_kernel_isrPrepareSwitch(hi);
                 rtos_port_switchContext();

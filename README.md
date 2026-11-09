@@ -170,7 +170,15 @@ with RTOS_PANIC_CONFIG instead of corrupting memory.
 * Mutexes use the immediate priority ceiling protocol: the owner runs at the ceiling, so
   with a correct ceiling nobody ever blocks on the mutex and deadlock is impossible. An
   owner that blocks while holding (allowed, discouraged) keeps the ceiling and is
-  scheduled by it when it wakes; so is a waiter the mutex is handed over to.
+  scheduled by it when it wakes; so is a waiter the mutex is handed over to. At an equal
+  effective priority the owner raised to the ceiling runs before the task whose base
+  priority is the ceiling (the order is the key effective priority, boosted, base
+  priority; doc/design.md).
+* A task whose function returns is terminated: RTOS_TASK_TERMINATED in rtos_getTaskInfo,
+  never scheduled again, slot and stack kept. Returning while holding a ceiling mutex is
+  a checked error (RTOS_PANIC_ARGUMENT). The life cycle and the rules a future dynamic
+  task API follows are in doc/design.md; the steps to that API, what is done and what
+  remains, in doc/dynamic_tasks_plan.md.
 * Interrupts that talk to the kernel are written with RTOS_ISR(vector) { ... } and use
   the *FromIsr functions; a task switch, if needed, happens once at the end of the ISR.
 * Critical sections are short cli/sei pairs with the previous state saved (nestable).
@@ -260,6 +268,15 @@ Three layers, all run by `make test-all` (about a minute with an ESP32 connected
                        holding is switched to by the interrupt tail when it wakes, a
                        waiter handed the mutex runs before a task between its base
                        priority and the ceiling, nested ceilings restore in LIFO order
+    test/test_tie.c    the scheduling order at equal effective priorities (the key
+                       effective priority, boosted, base priority): the owner at the
+                       ceiling beats the task whose base priority is the ceiling in the
+                       task-context pick and in the interrupt tail, two owners at one
+                       ceiling run in base order, a suspended owner holding a mutex
+    test/test_lifecycle.c a task whose function returns is RTOS_TASK_TERMINATED and deaf
+                       to every wake-up, a terminated slot reset with
+                       rtos_kernel_tcbReset starts a new task clean, and returning
+                       while holding a ceiling mutex is RTOS_PANIC_ARGUMENT
     test/test_robust.c robustness features on the host port, one child process per
                        scenario: deadlock, stack canary, task watchdog, timer task,
                        statistics and binary semaphore, task info, trace, assertion
@@ -313,20 +330,26 @@ period is dithered so that it lands at every phase of the tick and of the other 
 on the ESP32). All figures are taken with everything in the test running at once: the
 switch benchmark, the probe at ~770 Hz, the tick, and the default configuration (stack
 fill, run time statistics, assertions, software timers). simavr is cycle accurate and
-gives the same numbers as the board.
+gives the same numbers as the board (the isr -> task minimum is one lucky probe and may
+differ by a few cycles between the two). The figures below are from 2026-11-09
+(doc/measurements/step9-curboost-after.md), after the audit fixes and the scheduler
+contract for mutex ceilings; "ceiling held" repeats a row while the running task holds a
+mutex with a ceiling above its priority.
 
     mega2560, 16 MHz                      cycles        time
-    switch (sem give/take, per switch)    423 min       26.4 us   470 avg
-    switch (notify)                       411 min       25.7 us
-    switch (queue, 1 byte item)           522 min       32.6 us
-    isr entry (event to RTOS_ISR body)    50 min        3.1 us    max seen 31 us
-    isr -> task (give in ISR to task)     443 min       27.7 us   max seen 44 us
-    hw event -> task, best case                         31 us
-    api, no switch: sem give+take 133, notify 200, mutex lock+unlock 186,
-                    queue send+recv 429, mbox 269, pool alloc+free 461,
-                    evgroup set+wait 260, timer start+stop 222, getTick 21
+    switch (sem give/take, per switch)    439 min       27.4 us   479 avg
+    switch (notify)                       432 min       27.0 us
+    switch (queue, 1 byte item)           544 min       34.0 us
+    isr entry (event to RTOS_ISR body)    50 min        3.1 us    max seen 34 us
+    isr -> task (give in ISR to task)     471 min       29.4 us   max seen 52 us
+    isr -> task, ceiling held             493 min       30.8 us
+    hw event -> task, best case                         33.5 us
+    api, no switch: sem give+take 145 (ceiling held 153), notify 220,
+                    mutex lock+unlock 218, queue send+recv 453, mbox 282,
+                    pool alloc+free 487, evgroup set+wait 272, timer start+stop 241,
+                    getTick 21
     ram: tcb 42 B/task; sem 4, mutex 4, queue 12, mbox 7, pool 12, timer 18, evgroup 3;
-         min stack 96 B; the benchmark tasks use 36-55 B of stack plus what they print with
+         min stack 96 B; the benchmark tasks use 39-55 B of stack plus what they print with
 
 Stack per task (tc11, bytes left on the stack by the kernel and the port; the task's own
 frames come on top). An interrupt lands on the stack of the running task, so every task
@@ -391,20 +414,23 @@ interrupt dispatcher and the ISR tail into the exception handler (one frame each
 trampoline frame under every task cannot go without breaking the window spill chain.
 
     esp32, 240 MHz                        cycles        time
-    switch (sem give/take, per switch)    405 min       1.69 us   406 avg
-    switch (notify)                       415 min       1.73 us
-    switch (queue, 1 byte item)           457 min       1.90 us
-    isr entry (event to RTOS_ISR body)    35 avg        0.9 us    max seen 1.5 us
-    isr -> task (give in ISR to task)     417 min       1.74 us   max seen 3.2 us
+    switch (sem give/take, per switch)    408 min       1.70 us   409 avg
+    switch (notify)                       418 min       1.74 us
+    switch (queue, 1 byte item)           461 min       1.92 us
+    isr entry (event to RTOS_ISR body)    35 avg        0.9 us    max seen 2.7 us
+    isr -> task (give in ISR to task)     418 min       1.74 us   max seen 3.3 us
+    isr -> task, ceiling held             449 min       1.87 us
     hw event -> task, best case                         1.85 us
-    api, no switch: sem give+take 109, notify 141, mutex lock+unlock 138,
-                    queue send+recv 279, mbox 191, pool alloc+free 153,
-                    evgroup set+wait 134, timer start+stop 124, getTick 21
+    api, no switch: sem give+take 112 (ceiling held 115), notify 145,
+                    mutex lock+unlock 156, queue send+recv 285, mbox 194,
+                    pool alloc+free 176, evgroup set+wait 137, timer start+stop 124,
+                    getTick 21
     ram: tcb 72 B/task; sem 4, mutex 4, queue 16, mbox 12, pool 20, timer 28, evgroup 4;
-         min stack 512 B; the benchmark tasks use 300-448 B of stack
+         min stack 512 B; the benchmark tasks use 300-464 B of stack
 
-The ESP32 figures are from the board after the hot path work (2026-11-04 evening, the
-switch was 456 cycles before it); the entry minimum reads 0 because the probe timer's
+The ESP32 figures are from the board (2026-11-09; the switch was 456 cycles before the
+hot path work of 2026-11-04 and 405 after it, the audit fixes since then cost a few
+cycles each, see doc/measurements/); the entry minimum reads 0 because the probe timer's
 40 MHz counter is latched at the alarm. With the run time statistics off the switch is
 361 cycles, with assertions off as well 351 (1.46 us). The interrupt entry costs the
 same 850 ns whether the interrupted task is 0 or 32 call frames deep (tc12): the spill
