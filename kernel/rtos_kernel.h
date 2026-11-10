@@ -250,7 +250,7 @@ RTOS_KERNEL_HOT_INLINE void rtos_kernel_setEffPrio(rtos_tcb_t *pT, uint8_t effPr
     task other than the current one is boosted by a mutex ceiling (rtos_kernel_boostedMask
     & rtos_kernel_readyMask minus the current task's bit is not 0): the next task is then
     the greatest key (effective priority, boosted, base priority) among the ready tasks,
-    not the highest ready bit; see ranksAbove in rtos_kernel.c and doc/design.md. The
+    not the highest ready bit; see ranksAbove in rtos_kernel.c and nornDocs design.md. The
     current task's own boost is handled by the fast path's comparison, so a task that
     merely holds a mutex pays nothing here. Out of line and cold, and the inline callers return
     right after calling them, so that the hot path neither pays a call nor keeps anything

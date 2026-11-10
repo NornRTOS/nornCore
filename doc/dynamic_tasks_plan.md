@@ -5,7 +5,7 @@ lives for ever. The team's code review of 2026-11-08 decided to prepare for dyna
 tasks (creation and deletion at run time) before adding any further scheduler feature,
 and to do it by formalising the life cycle first. This document is the plan: what is
 done, what remains, in which order, and the decisions still open. The rules the steps
-build on are in doc/design.md, section "Task life cycle"; the contract for every step
+build on are in design.md in the nornDocs repository, section "Task life cycle"; the contract for every step
 is tests first, then the change, then a before/after measurement with tools/measure.sh
 into doc/measurements/.
 
@@ -94,7 +94,7 @@ rows of tc10 must not move.
   on all three targets, hot path unchanged with it on. A board application (tc16 or a
   wider tc08) that creates and deletes a task in a loop on the Mega and the ESP32,
   under the watchdog and the stack monitor, run once as a soak. Then README and
-  design.md: "What is deliberately absent" loses dynamic tasks and gains kill.
+  design.md (nornDocs): "What is deliberately absent" loses dynamic tasks and gains kill.
 
 ## Decisions wanted
 

@@ -34,7 +34,7 @@ third-party components in THIRD_PARTY_LICENSES.md.
 
 Adding an architecture means a new port/<arch>/ and hal/<arch>/ plus one line in the
 Makefile mapping its boards to the architecture. The kernel and the generic HAL are not
-touched; doc/porting.md describes the port interface.
+touched; porting.md in the nornDocs repository describes the port interface.
 
 ## Build
 
@@ -173,12 +173,12 @@ with RTOS_PANIC_CONFIG instead of corrupting memory.
   scheduled by it when it wakes; so is a waiter the mutex is handed over to. At an equal
   effective priority the owner raised to the ceiling runs before the task whose base
   priority is the ceiling (the order is the key effective priority, boosted, base
-  priority; doc/design.md).
+  priority; design.md in nornDocs).
 * A task whose function returns is terminated: RTOS_TASK_TERMINATED in rtos_getTaskInfo,
   never scheduled again, slot and stack kept. Returning while holding a ceiling mutex is
   a checked error (RTOS_PANIC_ARGUMENT). The life cycle and the rules a future dynamic
-  task API follows are in doc/design.md; the steps to that API, what is done and what
-  remains, in doc/dynamic_tasks_plan.md.
+  task API follows are in design.md in nornDocs; the steps to that API, what is done
+  and what remains, in doc/dynamic_tasks_plan.md.
 * Interrupts that talk to the kernel are written with RTOS_ISR(vector) { ... } and use
   the *FromIsr functions; a task switch, if needed, happens once at the end of the ISR.
 * Critical sections are short cli/sei pairs with the previous state saved (nestable).
@@ -197,7 +197,8 @@ with RTOS_PANIC_CONFIG instead of corrupting memory.
     software timers                    one shot and periodic, in the tick or in a task
     suspend / resume                   take a task out of scheduling and back
 
-doc/design.md explains the model and what was left out on purpose.
+design.md in the nornDocs repository explains the model and what was left out on
+purpose; `make api` there generates the API reference from kernel/rtos.h.
 
 ## Robustness
 
@@ -320,7 +321,7 @@ build/measure/<label>/.
 tc01..tc06 pass on a real Mega 2560 with the same counters as simavr, on the ESP32 board
 and in QEMU. Not covered yet: a real UNO, and static analysis beyond the compiler warnings
 (cppcheck is not installed here). .github/workflows/ci.yml runs the host tests, simavr
-and QEMU on every push. doc/porting.md describes the port interface.
+and QEMU on every push. porting.md in nornDocs describes the port interface.
 
 ## Timing (tc04, tc10)
 

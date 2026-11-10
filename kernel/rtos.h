@@ -33,8 +33,8 @@
  * returns it is terminated: RTOS_TASK_TERMINATED in rtos_getTaskInfo(), never scheduled
  * again, deaf to events, notifications and resumes. It must not hold a mutex at that
  * point (checked, see rtos_createTask()). The slot and the stack of a terminated task
- * stay in use; the kernel does not reuse them at run time yet. doc/design.md has the
- * states and the rules a future reap follows.
+ * stay in use; the kernel does not reuse them at run time yet. design.md in the
+ * nornDocs repository has the states and the rules a future reap follows.
  *
  * @par Two kinds of checks
  * "Checked" in this documentation means RTOS_CHECK: always compiled, a violation is
