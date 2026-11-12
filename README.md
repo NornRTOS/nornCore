@@ -26,8 +26,10 @@ third-party components in THIRD_PARTY_LICENSES.md.
                    esp32.ld (ROM loadable image, no bootloader)
     port/host/     Linux port on ucontext, used by the unit tests only
     hal/           drivers with one API for all architectures: uart.h, gpio.h, delay.h,
+                   flash.h (two erase blocks of non-volatile memory for the application's
+                   data: the top of the SPI flash on the ESP32, the EEPROM on the AVR),
                    hd44780 (LCD), dht11; hal/<arch>/ holds hal_arch.h (flash strings,
-                   delays), gpio_arch.h, uart.c and board.h (pin map per board)
+                   delays), gpio_arch.h, uart.c, flash.c and board.h (pin map per board)
     config/        rtos_config.template.h, copy to the application as rtos_config.h
     test/          host unit tests of the kernel, one program per test_*.c
     applications/<app>/  one folder per application: rtos_config.h and app.mk (BOARD)
@@ -224,7 +226,9 @@ What the kernel does when things go wrong, all optional per configuration:
     deadlock           a mutex lock that would wait follows the chain of owners; if it
                        leads back to the caller: RTOS_PANIC_DEADLOCK with both tasks.
     task inspection    rtos_getTaskInfo: state, what the task waits on and with which
-                       timeout, priorities, stack, run time, overruns.
+                       timeout, priorities, stack, run time, overruns. The nornSHELL
+                       module (nosh) puts these on a serial console as ps, mem, sched
+                       and uptime, using nothing but this public API.
     object statistics  queues count drops and their high water mark, mailboxes their
                        overwrites, pools their low water mark and failed allocations,
                        semaphores the gives lost at the limit (RTOS_SEM_INIT_BINARY).
