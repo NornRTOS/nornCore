@@ -1,0 +1,81 @@
+/**
+ * @file board.c
+ * ESP32 board support: the application timer on timer group 0, timer 0.
+ */
+
+#include "rtos.h"
+#include "board.h"
+
+#define TIMG0_T0CONFIG      PORT_REG(DR_REG_TIMG0_BASE + 0x00)
+#define TIMG0_T0LO          PORT_REG(DR_REG_TIMG0_BASE + 0x04)
+#define TIMG0_T0UPDATE      PORT_REG(DR_REG_TIMG0_BASE + 0x0C)
+#define TIMG0_T0ALARMLO     PORT_REG(DR_REG_TIMG0_BASE + 0x10)
+#define TIMG0_T0ALARMHI     PORT_REG(DR_REG_TIMG0_BASE + 0x14)
+#define TIMG0_T0LOADLO      PORT_REG(DR_REG_TIMG0_BASE + 0x18)
+#define TIMG0_T0LOADHI      PORT_REG(DR_REG_TIMG0_BASE + 0x1C)
+#define TIMG0_T0LOAD        PORT_REG(DR_REG_TIMG0_BASE + 0x20)
+#define TIMG0_INT_ENA       PORT_REG(DR_REG_TIMG0_BASE + 0x98)
+#define TIMG0_INT_CLR       PORT_REG(DR_REG_TIMG0_BASE + 0xA4)
+
+#define T0_EN               (1ul << 31)
+#define T0_INCREASE         (1ul << 30)
+#define T0_AUTORELOAD       (1ul << 29)
+#define T0_DIVIDER_SHIFT    13
+#define T0_LEVEL_INT_EN     (1ul << 11)
+#define T0_ALARM_EN         (1ul << 10)
+#define T0_INT              (1ul << 0)
+
+#define SRC_TG0_T0_LEVEL    14u
+#define CPU_INT_APP_TIMER   17u
+
+void board_appTimer_rtosBody(void);
+
+static void appTimerIsr(void)
+{
+    TIMG0_INT_CLR = T0_INT;
+    TIMG0_T0CONFIG |= T0_ALARM_EN;      /* the alarm disarms itself when it fires */
+#if RTOS_CFG_SMP
+    /* A handler that runs more than a period late finds the counter past the alarm, and
+       Espressif's QEMU then never fires it again: start the period over. It happens in
+       QEMU with two emulated cores (the other core's time slice delays this one by
+       milliseconds), never on the board nor with one core, so only an SMP build pays the
+       three register accesses. Before the body, not after: the latch written by T0UPDATE
+       is what the next read of T0LO returns, so a latch left behind at the end of the
+       handler would be the value the next handler's board_appTimerElapsed() sees (tc10,
+       tc12 measure their entry latency with it; nornInternal/nornCore/measurements/step18-tc10-smp.md). */
+    TIMG0_T0UPDATE = 1;
+    if(TIMG0_T0LO >= TIMG0_T0ALARMLO)
+        TIMG0_T0LOAD = 1;
+#endif
+    board_appTimer_rtosBody();
+}
+
+void board_appTimerStart(uint32_t hz)
+{
+    const uint32_t alarm = HAL_APB_HZ / BOARD_APP_TIMER_PRESCALER / hz;
+
+    TIMG0_T0CONFIG = 0;
+    TIMG0_T0LOADLO = 0;
+    TIMG0_T0LOADHI = 0;
+    TIMG0_T0LOAD = 1;
+    TIMG0_T0ALARMLO = alarm;
+    TIMG0_T0ALARMHI = 0;
+    TIMG0_INT_CLR = T0_INT;
+    TIMG0_INT_ENA |= T0_INT;
+    rtos_port_attachInterrupt(CPU_INT_APP_TIMER, SRC_TG0_T0_LEVEL, appTimerIsr);
+    TIMG0_T0CONFIG = T0_EN | T0_INCREASE | T0_AUTORELOAD
+                     | (BOARD_APP_TIMER_PRESCALER << T0_DIVIDER_SHIFT)
+                     | T0_LEVEL_INT_EN | T0_ALARM_EN;
+}
+
+uint32_t board_appTimerElapsed(void)
+{
+    TIMG0_T0UPDATE = 1;                 /* latch the counter into T0LO/T0HI */
+    return TIMG0_T0LO;
+}
+
+
+void board_hiresTimerSetPeriod(uint32_t counts)
+{
+    TIMG0_T0ALARMLO = counts;           /* the counter restarted at 0 on the alarm */
+}

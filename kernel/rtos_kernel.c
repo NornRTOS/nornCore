@@ -1,0 +1,1436 @@
+/**
+ * @file rtos_kernel.c
+ * Scheduler, task management, system time, delays and event flags.
+ *
+ * Scheduling model: one task per priority, the task id is the priority, task 0 is the idle
+ * task and is always ready. The scheduler keeps a bitmask of ready tasks; the running task
+ * is the highest set bit unless the current task holds a ceiling mutex, in which case it
+ * keeps running until a task above its effective priority becomes ready.
+ *
+ * Blocking model: a task blocks by clearing its own ready bit and calling schedule(). It is
+ * made ready again by an event, a semaphore, a mutex hand-over or the tick ISR (timeout).
+ * Timed waits sit in one list sorted by wake-up tick, so the tick ISR only inspects the head.
+ *
+ * All kernel functions that touch shared state run inside a port critical section. The
+ * context switch itself is done by the port layer (rtos_port_switchContext), which saves
+ * the callee-saved registers of the current task, stores its stack pointer in the TCB and
+ * loads the next task.
+ */
+
+#include "rtos.h"
+#include "rtos_assert.h"
+#include "rtos_kernel.h"
+
+
+/*
+ * Defines
+ */
+
+/** Byte pattern written into unused stack space for rtos_getStackFree. */
+#define STACK_FILL_PATTERN      RTOS_STACK_FILL
+
+
+/*
+ * Local prototypes
+ */
+
+static void insertTimed(rtos_tcb_t *pT);
+/* Out of line on purpose: inlined into makeReady it would make every wake up pay the
+   register saves of the list walk, which only a timed out or cancelled wait needs. */
+static void removeTimed(rtos_tcb_t *pT) __attribute__((noinline));
+
+
+/*
+ * Data definitions
+ */
+
+/** All task control blocks, index = task id = priority. Element 0 is the idle task. */
+rtos_tcb_t rtos_tcbAry[RTOS_NUM_TASKS];
+
+#if RTOS_CFG_SMP
+/** Per core (nornInternal/nornCore/smp_plan.md): the running task, the task to switch to, the switch request
+    of the ISR tail, the idle task of every core but core 0 (whose idle is rtos_tcbAry[0]),
+    and how many cores have reached their idle loop. Set up in rtos_initChecked. */
+rtos_tcb_t *rtos_kernel_pCurrentOf[RTOS_PORT_CORES];
+rtos_tcb_t *rtos_kernel_pNextOf[RTOS_PORT_CORES];
+volatile uint8_t rtos_kernel_needSwitchOf[RTOS_PORT_CORES];
+rtos_tcb_t rtos_kernel_idleOf[RTOS_PORT_CORES - 1u];
+volatile uint8_t rtos_kernel_coresUp;
+#else
+/** The running task. Read and written by the port layer during a context switch. */
+rtos_tcb_t *rtos_pCurrent = &rtos_tcbAry[RTOS_IDLE_TASK];
+
+/** The task to switch to. Written by the kernel right before rtos_port_switchContext. */
+rtos_tcb_t *rtos_pNext = &rtos_tcbAry[RTOS_IDLE_TASK];
+#endif
+
+/** Ready mask (idle always set), boosted mask, switch request; see rtos_kernel.h. */
+rtos_kernel_sched_t rtos_kernel_sched = { 1u, 0, 0 };
+#define _readyMask    rtos_kernel_readyMask
+#define _boostedMask  rtos_kernel_boostedMask
+
+/** Head of the list of tasks waiting with a timeout, sorted by wake-up tick. */
+static rtos_tcb_t *_pTimedHead = NULL;
+
+/** The system time. */
+volatile rtos_tick_t rtos_tickCount = 0;
+
+#if RTOS_CFG_RUNTIME_STATS
+/** Run time counter value at the last context switch. */
+#if RTOS_CFG_SMP
+static rtos_runtime_t _lastSwitchTimeOf[RTOS_PORT_CORES];   /* each core charges its own task */
+# define _lastSwitchTime    _lastSwitchTimeOf[rtos_port_coreId()]
+#else
+static rtos_runtime_t _lastSwitchTime = 0;
+#endif
+/** Reference values of the previous rtos_getCpuLoad call. */
+static rtos_runtime_t _loadRefTime = 0;
+static rtos_runtime_t _loadRefIdle = 0;
+#endif
+
+/** Index of the highest set bit of a nibble; 0 for 0. See rtos_kernel_highestBit. */
+const uint8_t rtos_kernel_hiBitNibble[16] = {0,0,1,1,2,2,2,2,3,3,3,3,3,3,3,3};
+
+#define highestBit(m)   rtos_kernel_highestBit(m)
+
+
+/*
+ * Function implementation
+ */
+
+/**
+ * Charge the time since the last switch to the current task. Interrupts disabled.
+ */
+RTOS_KERNEL_HOT_INLINE void accountRunTime(void)
+{
+#if RTOS_CFG_RUNTIME_STATS
+    const rtos_runtime_t now = rtos_port_getRunTimeCounter();
+    rtos_pCurrent->runTime += now - _lastSwitchTime;
+    _lastSwitchTime = now;
+#endif
+}
+
+/** Bring every core's current task up to date, for a reader of the statistics: under the
+    kernel lock the other cores' accounting is ours to do as well (their own happens under
+    the same lock). One core: the same as accountRunTime. */
+RTOS_KERNEL_HOT_INLINE void accountRunTimeAll(void)
+{
+#if RTOS_CFG_RUNTIME_STATS && RTOS_CFG_SMP
+    const rtos_runtime_t now = rtos_port_getRunTimeCounter();
+    uint8_t c;
+    for(c = 0; c < RTOS_PORT_CORES; ++c)
+    {
+        rtos_kernel_pCurrentOf[c]->runTime += now - _lastSwitchTimeOf[c];
+        _lastSwitchTimeOf[c] = now;
+    }
+#else
+    accountRunTime();
+#endif
+}
+
+/** Count the switch into \a pNext (RTOS_CFG_RUNTIME_STATS 2); nothing otherwise. */
+RTOS_KERNEL_HOT_INLINE void accountSwitch(rtos_tcb_t *pNext)
+{
+#if RTOS_CFG_RUNTIME_STATS >= 2
+    ++ pNext->switches;
+#else
+    (void)pNext;
+#endif
+}
+
+
+/**
+ * Stack bottom canary: the first bytes of a task's stack must still hold the fill
+ * pattern. Checked for the running task before every switch and at every tick, so an
+ * overflow is caught within a tick of happening instead of when the corruption bites.
+ */
+static inline void checkStack(const rtos_tcb_t *pT)
+{
+#if RTOS_CFG_STACK_CHECK >= 2
+    const uint8_t * const p = pT->pStackArea;
+    if(p != NULL
+       &&  (p[0] != STACK_FILL_PATTERN  ||  p[1] != STACK_FILL_PATTERN
+            ||  p[2] != STACK_FILL_PATTERN  ||  p[3] != STACK_FILL_PATTERN)
+      )
+        rtos_panic(RTOS_PANIC_STACK_OVERFLOW, pT->prio, 0);
+#else
+    (void)pT;
+#endif
+}
+
+
+/**
+ * Make a blocked task ready. Interrupts must be disabled. Does not switch; the caller
+ * decides when to run the scheduler (immediately in task context, at ISR exit in ISR
+ * context).
+ */
+rtos_taskmask_t rtos_kernel_getReadyMask(void)
+{
+    return _readyMask;
+}
+
+
+rtos_tcb_t *rtos_kernel_getTimedHead(void)
+{
+    return _pTimedHead;
+}
+
+
+void rtos_kernel_makeReady(rtos_tcb_t *pT)
+{
+    if(pT->flags & RTOS_TF_IN_TIMED_LIST)
+        removeTimed(pT);
+    if(pT->pWaiters != NULL)
+    {
+        *pT->pWaiters &= (rtos_taskmask_t)~pT->bit;
+        pT->pWaiters = NULL;
+    }
+    RTOS_TRACE(RTOS_TRACE_READY, pT->prio, pT->waitKind);
+#if RTOS_CFG_SUSPEND
+    if(pT->flags & RTOS_TF_SUSPENDED)
+    {
+        /* The wake up is consumed but the task stays off the ready mask until resume. */
+        pT->flags |= RTOS_TF_READY_PENDING;
+        return;
+    }
+#endif
+    _readyMask |= pT->bit;
+#if RTOS_CFG_SMP
+    rtos_kernel_smpKick(pT, true);
+#else
+    rtos_needSwitch = 1;
+#endif
+}
+
+
+#if !RTOS_CFG_SMP
+/** Switch to \a pNext unless it is the current task. Interrupts disabled, task context. */
+RTOS_KERNEL_HOT_INLINE void switchTo(rtos_tcb_t *pNext)
+{
+    rtos_tcb_t * const pCur = rtos_pCurrent;
+
+    rtos_pNext = pNext;
+    if(pNext != pCur)
+    {
+        checkStack(pCur);
+        RTOS_TRACE(RTOS_TRACE_SWITCH, pCur->prio, pNext->prio);
+        accountRunTime();
+        accountSwitch(pNext);
+        rtos_port_switchContext();
+    }
+}
+
+
+/**
+ * Pick the task to run and switch to it if it is not the current one. Interrupts must be
+ * disabled. Called in task context only. A port that defines RTOS_PORT_INLINE_SCHEDULE
+ * gets the body inlined into blockCurrent as well, one call level and one stack frame
+ * less on every blocking call (Xtensa, where a frame is 32 bytes and a call may spill a
+ * window); on the AVR the register pressure cost more than the call it saved.
+ */
+RTOS_KERNEL_HOT_INLINE void scheduleInline(void)
+{
+    rtos_tcb_t * const pCur = rtos_pCurrent;
+
+    rtos_needSwitch = 0;
+
+    /* The ready mask is indexed by base priority. While a task boosted by a mutex
+       ceiling is ready the pick must look at effective priorities: out of line. The
+       current task's own boost does not count: it is already in the comparison below
+       (hi > effPrio), and it would otherwise send every scheduling decision taken
+       while holding a mutex down the slow path. The test of the boosted mask alone
+       comes first so that the common case, no ceiling held anywhere, pays one compare
+       and no mask arithmetic (measured: it is one cycle cheaper than the plain
+       ready & boosted test on the Mega). */
+    if(_boostedMask != 0  &&  (_readyMask & _boostedMask & (rtos_taskmask_t)~pCur->bit) != 0)
+    {
+        rtos_kernel_scheduleBoosted();
+        return;
+    }
+
+    /* Switch if the current task blocked itself, or if a ready task is above the current
+       task's effective priority (base priority or a mutex ceiling). */
+    {
+        const uint8_t hi = highestBit(_readyMask);
+        if((_readyMask & pCur->bit) == 0  ||  hi > pCur->effPrio)
+            switchTo(&rtos_tcbAry[hi]);
+    }
+}
+#endif  /* !RTOS_CFG_SMP */
+
+
+/**
+ * The scheduling order: true if task \a pA ranks above task \a pB. Tasks are ordered by
+ * the key (effPrio, boosted, prio), compared lexicographically, where boosted means that
+ * the effective priority differs from the base priority, i.e. the task holds a mutex
+ * with a ceiling above its own priority. The highest effective priority wins; at an
+ * equal effective priority c a boosted owner ranks above the task whose base priority is
+ * c (that task is a user of the mutex and would block on it, which the ceiling protocol
+ * promises never happens), and two boosted tasks at one ceiling rank by base priority.
+ * The base priority is unique, so the order is total and no two tasks ever tie.
+ *   Only the slow paths use this: the fast path is taken when no ready task but possibly
+ * the current one is boosted, and there "highest ready bit above the current effective
+ * priority" is the same order (a boosted current task wins its tie with the task at the
+ * ceiling, which the strict comparison gives for free).
+ */
+static inline bool ranksAbove(const rtos_tcb_t *pA, const rtos_tcb_t *pB)
+{
+    if(pA->effPrio != pB->effPrio)
+        return pA->effPrio > pB->effPrio;
+    {
+        const bool aBoosted = pA->effPrio != pA->prio;
+        const bool bBoosted = pB->effPrio != pB->prio;
+        if(aBoosted != bBoosted)
+            return aBoosted;
+    }
+    return pA->prio > pB->prio;
+}
+
+
+#if RTOS_CFG_SMP
+
+/* ---- SMP scheduling (nornInternal/nornCore/smp_plan.md, step 4) ------------------------------------------
+ * The N highest ranked ready tasks run on the N cores. _runningMask says which tasks run
+ * on some core (never an idle task's bit); a core picks the best of the ready tasks nobody
+ * runs and its own current task, and takes its idle task when there is none. A wake-up
+ * goes to the core whose current task ranks lowest, through an IPI when that is another
+ * core: its ISR tail runs the same pick. Everything here runs under the kernel lock, so
+ * the view of the other cores' current tasks is consistent and a task is never picked by
+ * two cores. */
+
+static rtos_taskmask_t _runningMask;
+static bool _smpStarted;                    /* rtos_start has run: scheduling may switch */
+
+#if RTOS_CFG_SMP_AFFINITY
+/** Bit t of _allowedOn[c]: task t may run on core c. All set at start. Per core and not
+    per task so that the pick is one AND. */
+static rtos_taskmask_t _allowedOn[RTOS_PORT_CORES];
+# define ALLOWED_ON(core, pT)   ((_allowedOn[core] & (pT)->bit) != 0)
+#else
+# define ALLOWED_ON(core, pT)   true
+#endif
+
+static inline rtos_tcb_t *idleOf(uint8_t core)
+{
+    return core == 0 ? &rtos_tcbAry[RTOS_IDLE_TASK] : &rtos_kernel_idleOf[core - 1u];
+}
+
+/** The core whose current task ranks lowest among those task \a pT may run on; cores in
+    idle rank below every task, ties go to the lower core number. \a skip excludes one core
+    (RTOS_PORT_CORES excludes none). RTOS_PORT_CORES if no core qualifies. */
+static uint8_t lowestCore(const rtos_tcb_t *pT, uint8_t skip)
+{
+    uint8_t c, low = RTOS_PORT_CORES;
+    for(c = 0; c < RTOS_PORT_CORES; ++c)
+        if(c != skip  &&  ALLOWED_ON(c, pT)
+           &&  (low == RTOS_PORT_CORES
+                ||  ranksAbove(rtos_kernel_pCurrentOf[low], rtos_kernel_pCurrentOf[c])))
+            low = c;
+    (void)pT;
+    return low;
+}
+
+/** Task \a pT is ready and runs nowhere: if it ranks above the lowest core's current task,
+    that core must reschedule: this core through its switch request (the ISR tail or the
+    schedule that follows in task context), another through an IPI. With \a mine false this
+    core is not a candidate (it is about to run something better than \a pT). */
+void rtos_kernel_smpKick(rtos_tcb_t *pT, bool mine)
+{
+    const uint8_t me = rtos_port_coreId();
+    const uint8_t low = lowestCore(pT, mine ? RTOS_PORT_CORES : me);
+
+    if(low == RTOS_PORT_CORES  ||  !ranksAbove(pT, rtos_kernel_pCurrentOf[low]))
+        return;
+    if(low == me)
+        rtos_needSwitch = 1;
+    else
+        rtos_port_ipi(low);
+}
+
+/** The task this core should run now: the best (ranksAbove) of the ready tasks no core
+    runs and this core's current task if it is still ready; this core's idle if none. */
+static rtos_tcb_t *smpPick(void)
+{
+    rtos_tcb_t * const pCur = rtos_pCurrent;
+    rtos_taskmask_t cand = _readyMask & (rtos_taskmask_t)~_runningMask & (rtos_taskmask_t)~(rtos_taskmask_t)1u;
+    rtos_tcb_t *pBest;
+
+    if(pCur->prio != RTOS_IDLE_TASK  &&  (_readyMask & pCur->bit) != 0)
+        cand |= pCur->bit;              /* not when its affinity moved it away: filtered below */
+#if RTOS_CFG_SMP_AFFINITY
+    cand &= _allowedOn[rtos_port_coreId()];
+#endif
+    if(cand == 0)
+        return idleOf(rtos_port_coreId());
+    pBest = &rtos_tcbAry[highestBit(cand)];
+    {
+        rtos_taskmask_t boosted = cand & _boostedMask;
+        while(boosted != 0)
+        {
+            rtos_tcb_t * const pT = &rtos_tcbAry[highestBit(boosted)];
+            if(ranksAbove(pT, pBest))
+                pBest = pT;
+            boosted &= (rtos_taskmask_t)~pT->bit;
+        }
+    }
+    return pBest;
+}
+
+/** Account the switch from the current task to \a pNext on this core: the running mask,
+    the statistics, and a preempted current task that is still ready is offered to the
+    other cores. Interrupts disabled; the caller switches right after. */
+static void smpPrepareSwitch(rtos_tcb_t *pNext)
+{
+    rtos_tcb_t * const pCur = rtos_pCurrent;
+
+    rtos_pNext = pNext;
+    checkStack(pCur);
+    RTOS_TRACE(RTOS_TRACE_SWITCH, pCur->prio, pNext->prio);
+    accountRunTime();
+    accountSwitch(pNext);
+    _runningMask &= (rtos_taskmask_t)~pCur->bit;
+    if(pNext->prio != RTOS_IDLE_TASK)
+        _runningMask |= pNext->bit;
+    if(pCur->prio != RTOS_IDLE_TASK  &&  (_readyMask & pCur->bit) != 0)
+        rtos_kernel_smpKick(pCur, false);           /* preempted, still ready: elsewhere? */
+}
+
+/** Task context: run the best task for this core, switching if it is not the current. */
+RTOS_KERNEL_HOT_INLINE void scheduleInline(void)
+{
+    rtos_tcb_t *pNext;
+
+    rtos_needSwitch = 0;
+    pNext = smpPick();
+    if(pNext != rtos_pCurrent)
+    {
+        smpPrepareSwitch(pNext);
+        rtos_port_switchContext();
+    }
+}
+
+/** The ISR tail of an SMP build: the same pick, in the interrupt's frame. */
+void rtos_kernel_smpIsrTail(void)
+{
+    rtos_tcb_t *pNext;
+
+    rtos_needSwitch = 0;
+    pNext = smpPick();
+    if(pNext != rtos_pCurrent)
+    {
+        smpPrepareSwitch(pNext);
+        rtos_port_switchContext();
+    }
+}
+
+/** An IPI: another core made a task ready that should run here. The ISR tail picks it. */
+void rtos_port_ipiHandler(void)
+{
+    rtos_needSwitch = 1;
+}
+
+rtos_taskmask_t rtos_kernel_getRunningMask(void)
+{
+    return _runningMask;
+}
+
+#if RTOS_CFG_SMP_AFFINITY
+void rtos_setAffinity(uint8_t taskId, uint8_t coreMask)
+{
+    rtos_tcb_t *pT;
+    uint8_t c;
+    rtos_port_cs_t cs;
+
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
+    RTOS_CHECK(coreMask != 0  &&  (coreMask >> RTOS_PORT_CORES) == 0, coreMask, RTOS_PORT_CORES);
+    pT = &rtos_tcbAry[taskId];
+    cs = rtos_port_enterCritical();
+    for(c = 0; c < RTOS_PORT_CORES; ++c)
+    {
+        if(coreMask & (1u << c))
+            _allowedOn[c] |= pT->bit;
+        else
+            _allowedOn[c] &= (rtos_taskmask_t)~pT->bit;
+    }
+    if(_runningMask & pT->bit)
+    {
+        /* Running: on a core the mask excludes it must leave; that core's pick no longer
+           finds it a candidate and offers it to the cores that may take it. */
+        for(c = 0; c < RTOS_PORT_CORES; ++c)
+            if(rtos_kernel_pCurrentOf[c] == pT  &&  (coreMask & (1u << c)) == 0)
+            {
+                if(c == rtos_port_coreId())
+                    rtos_kernel_schedule();
+                else
+                    rtos_port_ipi(c);
+            }
+    }
+    else if(_readyMask & pT->bit)
+    {
+        rtos_kernel_smpKick(pT, true);  /* ready: a newly allowed core may be idle */
+        if(rtos_needSwitch  &&  _smpStarted)
+            rtos_kernel_schedule();     /* the kick named this core: act on it now */
+    }
+    rtos_port_exitCritical(cs);
+}
+
+uint8_t rtos_getAffinity(uint8_t taskId)
+{
+    uint8_t c, mask = 0;
+    const rtos_tcb_t *pT;
+
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
+    pT = &rtos_tcbAry[taskId];
+    for(c = 0; c < RTOS_PORT_CORES; ++c)
+        if(ALLOWED_ON(c, pT))
+            mask |= (uint8_t)(1u << c);
+    return mask;
+}
+#endif  /* RTOS_CFG_SMP_AFFINITY */
+
+#else  /* !RTOS_CFG_SMP */
+
+/**
+ * The ready task to run while a boosted task is ready: the greatest key (ranksAbove)
+ * among the highest ready bit and the ready boosted tasks. Every other ready task has
+ * its base priority as effective priority and is below the highest ready bit in every
+ * component of the key. Interrupts disabled. The cost is one iteration per ready boosted
+ * task; nested mutexes on one task are one bit.
+ */
+static rtos_tcb_t *pickBoosted(void)
+{
+    rtos_tcb_t *pBest = &rtos_tcbAry[highestBit(_readyMask)];
+    rtos_taskmask_t boosted = _readyMask & _boostedMask;
+
+    do
+    {
+        rtos_tcb_t * const pT = &rtos_tcbAry[highestBit(boosted)];
+        if(ranksAbove(pT, pBest))
+            pBest = pT;
+        boosted &= (rtos_taskmask_t)~pT->bit;
+    }
+    while(boosted != 0);
+    return pBest;
+}
+
+
+void rtos_kernel_scheduleBoosted(void)
+{
+    rtos_tcb_t * const pCur = rtos_pCurrent;
+    rtos_tcb_t * const pNext = pickBoosted();
+
+    if((_readyMask & pCur->bit) == 0  ||  ranksAbove(pNext, pCur))
+        switchTo(pNext);
+}
+
+
+void rtos_kernel_isrTailBoosted(void)
+{
+    rtos_tcb_t * const pNext = pickBoosted();
+
+    if(ranksAbove(pNext, rtos_pCurrent))
+    {
+        rtos_kernel_isrPrepareSwitch(pNext->prio);
+        rtos_port_switchContext();
+    }
+}
+
+#endif  /* RTOS_CFG_SMP */
+
+void rtos_kernel_schedule(void)
+{
+    scheduleInline();
+}
+
+
+
+
+/**
+ * Block the current task until it is made ready again, with an optional timeout.
+ * Interrupts must be disabled. Returns true if the wake-up was caused by the timeout.
+ */
+bool rtos_kernel_blockCurrent(rtos_tick_t timeout)
+{
+    rtos_tcb_t * const pCur = rtos_pCurrent;
+
+#if RTOS_CFG_SMP
+    RTOS_CHECK(pCur->prio != RTOS_IDLE_TASK, RTOS_IDLE_TASK, rtos_port_coreId());   /* idle must stay ready */
+#else
+    RTOS_CHECK(pCur != &rtos_tcbAry[RTOS_IDLE_TASK], RTOS_IDLE_TASK, 0);   /* idle must stay ready */
+#endif
+
+    pCur->flags &= (uint8_t)~RTOS_TF_TIMED_OUT;
+    if(timeout != RTOS_FOREVER)
+    {
+        /* The timed list compares signed differences: half the tick range at most. */
+        RTOS_CHECK(timeout <= RTOS_MAX_TIMEOUT, timeout, RTOS_MAX_TIMEOUT);
+        pCur->wakeAt = rtos_tickCount + timeout;
+        insertTimed(pCur);
+    }
+    RTOS_TRACE(RTOS_TRACE_BLOCK, pCur->prio, pCur->waitKind);
+    _readyMask &= (rtos_taskmask_t)~pCur->bit;
+#if defined(RTOS_PORT_INLINE_SCHEDULE)  &&  RTOS_PORT_INLINE_SCHEDULE
+    scheduleInline();
+#else
+    rtos_kernel_schedule();
+#endif
+
+    /* We are back: someone made us ready. The waiter pointer has been cleared by
+       whoever did it. */
+    pCur->waitKind = RTOS_WAIT_NONE;
+    pCur->pWaitObj = NULL;
+    return (pCur->flags & RTOS_TF_TIMED_OUT) != 0;
+}
+
+
+/**
+ * Insert a task into the timed list, sorted by wake-up time. Interrupts disabled.
+ */
+static void insertTimed(rtos_tcb_t *pT)
+{
+    rtos_tcb_t **ppLink = &_pTimedHead;
+
+    while(*ppLink != NULL
+          &&  (rtos_tickdiff_t)((*ppLink)->wakeAt - pT->wakeAt) <= 0
+         )
+    {
+        ppLink = &(*ppLink)->pNextTimed;
+    }
+    pT->pNextTimed = *ppLink;
+    *ppLink = pT;
+    pT->flags |= RTOS_TF_IN_TIMED_LIST;
+}
+
+
+/**
+ * Remove a task from the timed list. Interrupts disabled.
+ */
+static void removeTimed(rtos_tcb_t *pT)
+{
+    rtos_tcb_t **ppLink = &_pTimedHead;
+
+    while(*ppLink != NULL  &&  *ppLink != pT)
+        ppLink = &(*ppLink)->pNextTimed;
+
+    RTOS_ASSERT(*ppLink == pT);
+    *ppLink = pT->pNextTimed;
+    pT->flags &= (uint8_t)~RTOS_TF_IN_TIMED_LIST;
+}
+
+
+/**
+ * The tick. Called by the port layer from the timer ISR with interrupts disabled.
+ */
+void rtos_tickFromIsr(void)
+{
+    const rtos_tick_t now = ++rtos_tickCount;
+
+    checkStack(rtos_pCurrent);
+
+    while(_pTimedHead != NULL  &&  (rtos_tickdiff_t)(_pTimedHead->wakeAt - now) <= 0)
+    {
+        rtos_tcb_t * const pT = _pTimedHead;
+
+        _pTimedHead = pT->pNextTimed;
+        pT->flags = (uint8_t)((pT->flags & ~RTOS_TF_IN_TIMED_LIST) | RTOS_TF_TIMED_OUT);
+        pT->evtWait = 0;
+        rtos_kernel_makeReady(pT);
+    }
+
+#if RTOS_CFG_SW_TIMERS
+    rtos_kernel_timerTick(now);
+#endif
+}
+
+
+/**
+ * Called by the port layer at the end of every RTOS_ISR with interrupts disabled. Switches
+ * to a higher priority task if one was made ready by the ISR. The body is in
+ * rtos_kernel_isrTailInline (rtos_kernel.h) for ports that want it without a call level.
+ */
+void rtos_isrTail(void)
+{
+    rtos_kernel_isrTailInline();
+}
+
+#if !RTOS_CFG_SMP
+void rtos_kernel_isrPrepareSwitch(uint8_t hi)
+{
+    rtos_pNext = &rtos_tcbAry[hi];
+    checkStack(rtos_pCurrent);
+    RTOS_TRACE(RTOS_TRACE_SWITCH, rtos_pCurrent->prio, hi);
+    accountRunTime();
+    accountSwitch(rtos_pNext);
+}
+#endif
+
+
+/**
+ * Task start, in three steps so that a port whose stack frames are expensive can run them
+ * from a frameless assembly stub and give the task function the top frame of its stack
+ * (port/xtensa). Interrupts are disabled on entry to the first step.
+ */
+rtos_taskFunc_t rtos_kernel_taskStarting(void)
+{
+    rtos_tcb_t * const pCur = rtos_pCurrent;
+
+    pCur->periodBase = rtos_tickCount;
+    rtos_port_enableInterrupts();
+    return pCur->taskFunc;
+}
+
+void *rtos_kernel_taskStartArg(void)
+{
+    return rtos_kernel_current()->arg;
+}
+
+void rtos_kernel_taskExit(void)
+{
+    /* The task function returned. Terminate the task: off the ready mask for good, and
+       marked so that rtos_getTaskInfo can tell it from a blocked task and nothing can
+       make it ready again (the wait kind is what every wake-up path checks). */
+    rtos_tcb_t * const pCur = rtos_kernel_current();
+    (void)rtos_port_enterCritical();
+
+    /* A mutex taken into the grave keeps its owner for ever, and a later lock waits with
+       no deadlock panic (the detector follows mutex waits only). Every mutex with a
+       ceiling above the task's priority shows in the effective priority. */
+    RTOS_CHECK(pCur->effPrio == pCur->prio, pCur->prio, pCur->effPrio);
+#if RTOS_CFG_DYNAMIC_TASKS
+    /* The count sees the mutex whose ceiling equals the owner's priority as well. */
+    RTOS_CHECK(pCur->mutexHeld == 0, pCur->prio, pCur->mutexHeld);
+#endif
+
+    pCur->waitKind = RTOS_WAIT_TERMINATED;
+    pCur->pWaitObj = NULL;
+    RTOS_TRACE(RTOS_TRACE_BLOCK, pCur->prio, RTOS_WAIT_TERMINATED);
+    _readyMask &= (rtos_taskmask_t)~pCur->bit;
+    rtos_kernel_schedule();
+
+    /* Never reached. */
+    for(;;)
+        ;
+}
+
+/**
+ * First code executed in a new task's context on the ports that reach it through the
+ * return address placed on the prepared stack (AVR, host).
+ */
+void rtos_taskTrampoline(void)
+{
+    const rtos_taskFunc_t f = rtos_kernel_taskStarting();
+    f(rtos_kernel_taskStartArg());
+    rtos_kernel_taskExit();
+}
+
+
+/*
+ * Public API
+ */
+
+RTOS_PORT_WEAK void rtos_idleHook(void)
+{
+}
+
+#if RTOS_CFG_TRACE
+/** Weak default so that a kernel built with tracing links without the application
+    recording anything; hal/trace.h shows the ring buffer override. */
+RTOS_PORT_WEAK void rtos_traceHook(uint8_t event, uint32_t a, uint32_t b)
+{
+    (void)event; (void)a; (void)b;
+}
+#endif
+
+
+/** The body of rtos_kernel_tcbReset for any TCB: \a i is the task id the TCB stands for
+    (its priority and ready bit). Inlined into its one caller, two with RTOS_CFG_SMP. */
+RTOS_KERNEL_HOT_INLINE void tcbInit(rtos_tcb_t *pT, uint8_t i)
+{
+    pT->ctx = (rtos_port_ctx_t)0;
+    pT->taskFunc = NULL;
+    pT->arg = NULL;
+    pT->pNextTimed = NULL;
+    pT->pWaiters = NULL;
+    pT->pXfer = NULL;
+    pT->wakeAt = 0;
+    pT->periodBase = 0;
+    pT->evtPending = 0;
+    pT->evtWait = 0;
+#if RTOS_CFG_NOTIFY
+    pT->notifyValue = 0;
+#endif
+#if RTOS_CFG_RUNTIME_STATS
+    pT->runTime = 0;
+#endif
+#if RTOS_CFG_RUNTIME_STATS >= 2
+    pT->switches = 0;
+#endif
+#if RTOS_CFG_STACK_CHECK
+    pT->pStackArea = NULL;
+    pT->stackSize = 0;
+#endif
+    pT->bit = (rtos_taskmask_t)1u << i;
+    pT->prio = i;
+    pT->effPrio = i;
+    _boostedMask &= (rtos_taskmask_t)~pT->bit;
+    pT->flags = 0;
+    pT->cntOverrun = 0;
+    pT->waitKind = RTOS_WAIT_NONE;
+    pT->pWaitObj = NULL;
+#if RTOS_CFG_DYNAMIC_TASKS
+    pT->mutexHeld = 0;
+#endif
+}
+
+void rtos_kernel_tcbReset(uint8_t i)
+{
+    tcbInit(&rtos_tcbAry[i], i);
+}
+
+
+#if RTOS_CFG_SMP
+void rtos_initChecked2(uint32_t configSignature, uint32_t configSignature2)
+{
+    if(configSignature2 != RTOS_CONFIG_SIGNATURE2)
+        rtos_panic(RTOS_PANIC_CONFIG, configSignature2, RTOS_CONFIG_SIGNATURE2);
+    rtos_initChecked(configSignature);
+}
+#endif
+
+
+void rtos_initChecked(uint32_t configSignature)
+{
+    uint8_t i;
+
+    if(configSignature != RTOS_CONFIG_SIGNATURE)
+        rtos_panic(RTOS_PANIC_CONFIG, configSignature, RTOS_CONFIG_SIGNATURE);
+
+    for(i=0; i<RTOS_NUM_TASKS; ++i)
+        rtos_kernel_tcbReset(i);
+    rtos_kernel_panicInit();
+    _readyMask = rtos_tcbAry[RTOS_IDLE_TASK].bit;
+    _boostedMask = 0;
+    _pTimedHead = NULL;
+    rtos_tickCount = 0;
+#if RTOS_CFG_SMP
+    {
+        uint8_t c;
+        rtos_kernel_pCurrentOf[0] = &rtos_tcbAry[RTOS_IDLE_TASK];
+        for(c = 1; c < RTOS_PORT_CORES; ++c)
+        {
+            tcbInit(&rtos_kernel_idleOf[c - 1u], RTOS_IDLE_TASK);   /* prio 0, bit 0, like core 0's */
+            rtos_kernel_pCurrentOf[c] = &rtos_kernel_idleOf[c - 1u];
+        }
+        for(c = 0; c < RTOS_PORT_CORES; ++c)
+        {
+            rtos_kernel_pNextOf[c] = rtos_kernel_pCurrentOf[c];
+            rtos_kernel_needSwitchOf[c] = 0;
+        }
+        rtos_kernel_coresUp = 0;
+        _runningMask = 0;
+        _smpStarted = false;
+#if RTOS_CFG_SMP_AFFINITY
+        for(c = 0; c < RTOS_PORT_CORES; ++c)
+            _allowedOn[c] = (rtos_taskmask_t)~(rtos_taskmask_t)0;
+#endif
+    }
+#else
+    rtos_needSwitch = 0;
+    rtos_pCurrent = &rtos_tcbAry[RTOS_IDLE_TASK];
+    rtos_pNext = rtos_pCurrent;
+#endif
+}
+
+
+void rtos_createTask( uint8_t prio
+                    , rtos_taskFunc_t taskFunc
+                    , void *arg
+                    , uint8_t *stackArea
+                    , size_t stackSize
+                    )
+{
+    rtos_tcb_t *pT;
+
+    RTOS_CHECK(prio >= 1  &&  prio < RTOS_NUM_TASKS, prio, RTOS_NUM_TASKS);
+    RTOS_CHECK(taskFunc != NULL  &&  stackArea != NULL, (uintptr_t)taskFunc, (uintptr_t)stackArea);
+    pT = &rtos_tcbAry[prio];
+    RTOS_CHECK(pT->taskFunc == NULL, prio, 0);          /* the slot is in use */
+
+    /* Trim the area to the alignment the port's ABI requires for stack frames. */
+    {
+        const size_t misalign = (size_t)((uintptr_t)stackArea % RTOS_PORT_STACK_ALIGN);
+        if(misalign != 0)
+        {
+            const size_t skip = RTOS_PORT_STACK_ALIGN - misalign;
+            RTOS_CHECK(stackSize > skip, stackSize, skip);
+            stackArea += skip;
+            stackSize -= skip;
+        }
+        stackSize -= stackSize % RTOS_PORT_STACK_ALIGN;
+    }
+    RTOS_CHECK(stackSize >= RTOS_PORT_MIN_STACK, stackSize, RTOS_PORT_MIN_STACK);
+
+    pT->taskFunc = taskFunc;
+    pT->arg = arg;
+#if RTOS_CFG_STACK_CHECK
+    pT->pStackArea = stackArea;
+    pT->stackSize = stackSize;
+    {
+        size_t i;
+        for(i=0; i<stackSize; ++i)
+            stackArea[i] = STACK_FILL_PATTERN;
+    }
+#endif
+    pT->ctx = rtos_port_initStack(stackArea, stackSize, rtos_taskTrampoline);
+    _readyMask |= pT->bit;
+}
+
+
+#if RTOS_CFG_STACK_CHECK  &&  RTOS_CFG_STACK_WARN
+RTOS_PORT_WEAK void rtos_stackWarnHook(uint8_t task, size_t stackFree)
+{
+    (void)task;
+    (void)stackFree;
+}
+
+/** One task per idle loop: read its high water mark, warn once when the margin is gone. */
+static void stackMonitorIdle(void)
+{
+    static uint8_t next = 1;
+    static rtos_taskmask_t warned = 0;
+    const uint8_t task = next;
+
+    next = (uint8_t)(next + 1u >= RTOS_NUM_TASKS ? 1u : next + 1u);
+    if(rtos_tcbAry[task].taskFunc != NULL  &&  (warned & rtos_tcbAry[task].bit) == 0)
+    {
+        const size_t free = rtos_getStackFree(task);
+        if(free < RTOS_PORT_STACK_WARN)
+        {
+            warned |= rtos_tcbAry[task].bit;
+            rtos_stackWarnHook(task, free);
+        }
+    }
+}
+#endif
+
+
+#if RTOS_CFG_SMP
+/** The idle loop of every core but core 0: this core's idle task is its current task
+    from rtos_initChecked, and the port adopts the core's own context at the first switch
+    away. Nothing but sleeping until an interrupt (an IPI from step 4 on) wakes it; the
+    application's idle hook and the monitors run on core 0 only, so that what they drive
+    (simulated time in the host tests) stays in one place. */
+static void secondaryIdle(void)
+{
+    (void)rtos_port_enterCritical();
+#if RTOS_CFG_RUNTIME_STATS
+    _lastSwitchTime = rtos_port_getRunTimeCounter();
+#endif
+    ++ rtos_kernel_coresUp;
+    /* A task ready before this core came up and allowed only here (affinity) has nobody
+       to kick for it: this core looks once itself, and runs it if it is the best. */
+    rtos_kernel_schedule();
+    rtos_port_enableInterrupts();
+    for(;;)
+        rtos_port_idleSleep();
+}
+#endif
+
+
+void rtos_start(void)
+{
+#if RTOS_CFG_TIMER_TASK_PRIO > 0
+    rtos_kernel_timerTaskCreate();
+#endif
+    rtos_port_startTimer();
+    (void)rtos_port_enterCritical();
+#if RTOS_CFG_RUNTIME_STATS
+    _lastSwitchTime = rtos_port_getRunTimeCounter();
+    _loadRefTime = _lastSwitchTime;
+    _loadRefIdle = 0;
+#endif
+#if RTOS_CFG_SMP
+    {
+        uint8_t c;
+        ++ rtos_kernel_coresUp;                          /* core 0 */
+        _smpStarted = true;
+        for(c = 1; c < RTOS_PORT_CORES; ++c)
+            rtos_port_startCore(c, secondaryIdle);
+    }
+#endif
+    rtos_kernel_schedule();
+    rtos_port_enableInterrupts();
+
+    /* From here on this context is the idle task. */
+    for(;;)
+    {
+#ifdef RTOS_CFG_IDLE_HOOK
+        RTOS_CFG_IDLE_HOOK();
+#else
+        rtos_idleHook();
+#endif
+#if RTOS_CFG_WATCHDOG
+        rtos_kernel_wdtIdle();
+#endif
+#if RTOS_CFG_STACK_CHECK  &&  RTOS_CFG_STACK_WARN
+        stackMonitorIdle();
+#endif
+#if RTOS_CFG_TICKLESS
+        rtos_port_idleSleepTicks(rtos_kernel_ticksToNextWake());
+#elif RTOS_CFG_IDLE_SLEEP
+        rtos_port_idleSleep();
+#endif
+    }
+}
+
+
+rtos_tick_t rtos_getTick(void)
+{
+#if RTOS_CFG_SMP  &&  RTOS_CFG_TICK_BITS == 32
+    /* One aligned 32 bit word: the read is atomic on every SMP port, and the kernel lock
+       would cost about a hundred cycles for it (nornInternal/nornCore/measurements/step16-lock.md). */
+    return rtos_tickCount;
+#else
+    rtos_tick_t t;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+    t = rtos_tickCount;
+    rtos_port_exitCritical(cs);
+    return t;
+#endif
+}
+
+
+void rtos_delay(rtos_tick_t ticks)
+{
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+    if(ticks == RTOS_FOREVER)
+        (void)rtos_kernel_blockOn(RTOS_WAIT_DELAY, NULL, RTOS_FOREVER);
+    else
+    {
+        /* A wait of n ticks that does not start on a tick lasts at least n - 1 tick
+           periods: hence the +1. One wait reaches at most RTOS_MAX_TIMEOUT, so a longer
+           delay is a sequence of waits, each counted as RTOS_MAX_TIMEOUT - 1. This also
+           keeps RTOS_FOREVER - 1 from becoming RTOS_FOREVER through the +1. */
+        while(ticks >= RTOS_MAX_TIMEOUT)
+        {
+            (void)rtos_kernel_blockOn(RTOS_WAIT_DELAY, NULL, RTOS_MAX_TIMEOUT);
+            ticks = (rtos_tick_t)(ticks - (RTOS_MAX_TIMEOUT - 1u));
+        }
+        (void)rtos_kernel_blockOn(RTOS_WAIT_DELAY, NULL, (rtos_tick_t)(ticks + 1u));
+    }
+    rtos_port_exitCritical(cs);
+}
+
+
+bool rtos_waitPeriodic(rtos_tick_t period)
+{
+    rtos_tcb_t * const pCur = rtos_kernel_current();
+    bool overrun = false;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+    RTOS_CHECK((rtos_tick_t)(period - 1u) < RTOS_MAX_TIMEOUT, period, RTOS_MAX_TIMEOUT);   /* 1..MAX */
+    pCur->periodBase += period;
+    if((rtos_tickdiff_t)(pCur->periodBase - rtos_tickCount) <= 0)
+    {
+        /* The boundary is already in the past: overrun. Re-base to now so that the task
+           runs immediately and the next period starts from here. */
+        overrun = true;
+        if(pCur->cntOverrun < 0xFFu)
+            ++ pCur->cntOverrun;
+        pCur->periodBase = rtos_tickCount;
+    }
+    else
+    {
+        pCur->wakeAt = pCur->periodBase;
+        pCur->waitKind = RTOS_WAIT_PERIODIC;
+        insertTimed(pCur);
+        _readyMask &= (rtos_taskmask_t)~pCur->bit;
+        rtos_kernel_schedule();
+        pCur->waitKind = RTOS_WAIT_NONE;
+    }
+    rtos_port_exitCritical(cs);
+    return overrun;
+}
+
+
+/**
+ * The event condition check shared by wait and post.
+ *   @return The satisfying events, or 0 if the condition is not met.
+ */
+static inline rtos_evt_t evtMatch(rtos_evt_t pending, rtos_evt_t mask, uint8_t flags)
+{
+    const rtos_evt_t got = pending & mask;
+
+    if(flags & RTOS_TF_WAIT_ALL)
+        return got == mask ? mask : 0;
+    else
+        return got;
+}
+
+
+rtos_evt_t rtos_waitEvents(rtos_evt_t mask, uint8_t opt, rtos_tick_t timeout)
+{
+    rtos_tcb_t * const pCur = rtos_kernel_current();
+    rtos_evt_t got;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+    RTOS_ASSERT(mask != 0);
+    if(opt == RTOS_WAIT_ALL)
+        pCur->flags |= RTOS_TF_WAIT_ALL;
+    else
+        pCur->flags &= (uint8_t)~RTOS_TF_WAIT_ALL;
+
+    got = evtMatch(pCur->evtPending, mask, pCur->flags);
+    if(got == 0  &&  timeout != RTOS_NO_WAIT)
+    {
+        pCur->evtWait = mask;
+        (void)rtos_kernel_blockOn(RTOS_WAIT_EVENTS, NULL, timeout);
+        pCur->evtWait = 0;
+        got = evtMatch(pCur->evtPending, mask, pCur->flags);
+    }
+    pCur->evtPending &= (rtos_evt_t)~got;
+    rtos_port_exitCritical(cs);
+    return got;
+}
+
+
+/**
+ * Post events to a task; interrupts disabled. Makes the task ready if its wait condition
+ * is now met. Returns nothing; scheduling is up to the caller.
+ *   The task must be waiting on its private events: evtWait is shared with the event
+ * group wait (rtos_evgroup.c), where it holds the group mask and must only be matched by
+ * the group's bits. waitKind tells the two apart; it is RTOS_WAIT_EVENTS only between
+ * rtos_waitEvents setting evtWait and the task running again.
+ */
+static inline void postEventsInner(rtos_tcb_t *pT, rtos_evt_t events)
+{
+    pT->evtPending |= events;
+    if(pT->waitKind == RTOS_WAIT_EVENTS  &&  evtMatch(pT->evtPending, pT->evtWait, pT->flags) != 0)
+    {
+        pT->evtWait = 0;
+        rtos_kernel_makeReady(pT);
+    }
+}
+
+
+void rtos_postEvents(uint8_t taskId, rtos_evt_t events)
+{
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
+    postEventsInner(&rtos_tcbAry[taskId], events);
+    rtos_kernel_schedule();
+    rtos_port_exitCritical(cs);
+}
+
+
+void rtos_postEventsFromIsr(uint8_t taskId, rtos_evt_t events)
+{
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
+    postEventsInner(&rtos_tcbAry[taskId], events);
+}
+
+
+void rtos_broadcastEvents(rtos_evt_t events)
+{
+    uint8_t i;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+    for(i=1; i<RTOS_NUM_TASKS; ++i)
+        if(rtos_tcbAry[i].taskFunc != NULL)
+            postEventsInner(&rtos_tcbAry[i], events);
+    rtos_kernel_schedule();
+    rtos_port_exitCritical(cs);
+}
+
+
+uint8_t rtos_getCurrentTask(void)
+{
+    return rtos_kernel_current()->prio;
+}
+
+
+uint8_t rtos_getOverrunCount(uint8_t taskId, bool reset)
+{
+    uint8_t n;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+    RTOS_CHECK(taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
+    n = rtos_tcbAry[taskId].cntOverrun;
+    if(reset)
+        rtos_tcbAry[taskId].cntOverrun = 0;
+    rtos_port_exitCritical(cs);
+    return n;
+}
+
+
+size_t rtos_getStackFree(uint8_t taskId)
+{
+#if RTOS_CFG_STACK_CHECK
+    const rtos_tcb_t *pT;
+    const uint8_t *p;
+    size_t n = 0;
+
+    RTOS_CHECK(taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
+    pT = &rtos_tcbAry[taskId];
+    p = pT->pStackArea;
+    if(p == NULL)
+        return 0;
+    while(n < pT->stackSize  &&  *p == STACK_FILL_PATTERN)
+    {
+        ++ p;
+        ++ n;
+    }
+    return n;
+#else
+    (void)taskId;
+    return 0;
+#endif
+}
+
+
+#if RTOS_CFG_SUSPEND
+void rtos_suspend(uint8_t taskId)
+{
+    rtos_tcb_t *pT;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
+    pT = &rtos_tcbAry[taskId];
+    if((pT->flags & RTOS_TF_SUSPENDED) == 0)
+    {
+        pT->flags |= RTOS_TF_SUSPENDED;
+        if(_readyMask & pT->bit)
+        {
+            /* Was runnable: remember that, so resume makes it runnable again. */
+            _readyMask &= (rtos_taskmask_t)~pT->bit;
+            pT->flags |= RTOS_TF_READY_PENDING;
+        }
+        if(pT == rtos_pCurrent)
+            rtos_kernel_schedule();
+#if RTOS_CFG_SMP
+        else if(_runningMask & pT->bit)
+        {
+            uint8_t c;                  /* running on another core: that core re-picks */
+            for(c = 0; c < RTOS_PORT_CORES; ++c)
+                if(rtos_kernel_pCurrentOf[c] == pT)
+                    rtos_port_ipi(c);
+        }
+#endif
+    }
+    rtos_port_exitCritical(cs);
+}
+
+
+void rtos_resume(uint8_t taskId)
+{
+    rtos_tcb_t *pT;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
+    pT = &rtos_tcbAry[taskId];
+    if(pT->flags & RTOS_TF_SUSPENDED)
+    {
+        pT->flags &= (uint8_t)~RTOS_TF_SUSPENDED;
+        if(pT->flags & RTOS_TF_READY_PENDING)
+        {
+            pT->flags &= (uint8_t)~RTOS_TF_READY_PENDING;
+            _readyMask |= pT->bit;
+            rtos_needSwitch = 1;
+            rtos_kernel_schedule();
+        }
+    }
+    rtos_port_exitCritical(cs);
+}
+
+
+void rtos_resumeFromIsr(uint8_t taskId)
+{
+    rtos_tcb_t * const pT = &rtos_tcbAry[taskId];
+
+    RTOS_CHECK(taskId >= 1  &&  taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
+    if((pT->flags & RTOS_TF_SUSPENDED) != 0)
+    {
+        pT->flags &= (uint8_t)~RTOS_TF_SUSPENDED;
+        if(pT->flags & RTOS_TF_READY_PENDING)
+        {
+            pT->flags &= (uint8_t)~RTOS_TF_READY_PENDING;
+            _readyMask |= pT->bit;
+            rtos_needSwitch = 1;        /* the ISR tail switches */
+        }
+    }
+}
+#endif
+
+
+rtos_tick_t rtos_kernel_ticksToNextWake(void)
+{
+    rtos_tick_t next = RTOS_FOREVER;
+    if(_pTimedHead != NULL)
+    {
+        const rtos_tickdiff_t d = (rtos_tickdiff_t)(_pTimedHead->wakeAt - rtos_tickCount);
+        next = d <= 0 ? 0u : (rtos_tick_t)d;
+    }
+#if RTOS_CFG_SW_TIMERS
+    {
+        const rtos_tick_t t = rtos_kernel_timerTicksToNext();
+        if(t < next)
+            next = t;
+    }
+#endif
+    return next;
+}
+
+
+bool rtos_getTaskInfo(uint8_t taskId, rtos_taskInfo_t *pInfo)
+{
+    const rtos_tcb_t *pT;
+    rtos_port_cs_t cs;
+
+    if(taskId >= RTOS_NUM_TASKS  ||  pInfo == NULL)
+        return false;
+    pT = &rtos_tcbAry[taskId];
+    cs = rtos_port_enterCritical();
+    if(taskId != RTOS_IDLE_TASK  &&  pT->taskFunc == NULL)
+        pInfo->state = RTOS_TASK_NONE;
+    else if(pT->waitKind == RTOS_WAIT_TERMINATED)
+        pInfo->state = RTOS_TASK_TERMINATED;    /* before suspended: final either way */
+    else if(pT->flags & RTOS_TF_SUSPENDED)
+        pInfo->state = RTOS_TASK_SUSPENDED;
+#if RTOS_CFG_SMP
+    else if(taskId == RTOS_IDLE_TASK ? pT == rtos_kernel_pCurrentOf[0] : (_runningMask & pT->bit) != 0)
+        pInfo->state = RTOS_TASK_RUNNING;
+#else
+    else if(pT == rtos_pCurrent)
+        pInfo->state = RTOS_TASK_RUNNING;
+#endif
+    else if(_readyMask & pT->bit)
+        pInfo->state = RTOS_TASK_READY;
+    else
+        pInfo->state = RTOS_TASK_BLOCKED;
+    pInfo->prio = pT->prio;
+    pInfo->effPrio = pT->effPrio;
+    pInfo->waitKind = pInfo->state >= RTOS_TASK_BLOCKED ? pT->waitKind : RTOS_WAIT_NONE;
+    pInfo->pWaitObj = pInfo->state >= RTOS_TASK_BLOCKED ? pT->pWaitObj : NULL;
+    pInfo->hasTimeout = (pT->flags & RTOS_TF_IN_TIMED_LIST) != 0;
+    pInfo->wakeAt = pT->wakeAt;
+#if RTOS_CFG_STACK_CHECK
+    pInfo->stackSize = pT->stackSize;
+#else
+    pInfo->stackSize = 0;
+#endif
+    pInfo->overruns = pT->cntOverrun;
+#if RTOS_CFG_RUNTIME_STATS
+    accountRunTimeAll();
+    pInfo->runTime = pT->runTime;
+#else
+    pInfo->runTime = 0;
+#endif
+#if RTOS_CFG_SMP
+    {
+        uint8_t c;
+        pInfo->core = RTOS_NO_CORE;
+        for(c = 0; c < RTOS_PORT_CORES; ++c)
+            if(rtos_kernel_pCurrentOf[c] == pT)
+                pInfo->core = c;
+    }
+#else
+    pInfo->core = pInfo->state == RTOS_TASK_RUNNING ? 0u : RTOS_NO_CORE;
+#endif
+#if RTOS_CFG_RUNTIME_STATS >= 2
+    pInfo->switches = pT->switches;
+#else
+    pInfo->switches = 0;
+#endif
+#if RTOS_CFG_DYNAMIC_TASKS
+    pInfo->mutexHeld = pT->mutexHeld;
+#else
+    pInfo->mutexHeld = 0;
+#endif
+    rtos_port_exitCritical(cs);
+    pInfo->stackFree = rtos_getStackFree(taskId);
+    return true;
+}
+
+
+rtos_runtime_t rtos_getTaskRunTime(uint8_t taskId)
+{
+#if RTOS_CFG_RUNTIME_STATS
+    rtos_runtime_t t;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+    RTOS_CHECK(taskId < RTOS_NUM_TASKS, taskId, RTOS_NUM_TASKS);
+    accountRunTimeAll();
+    t = rtos_tcbAry[taskId].runTime;
+    rtos_port_exitCritical(cs);
+    return t;
+#else
+    (void)taskId;
+    return 0;
+#endif
+}
+
+
+#if RTOS_CFG_SMP && RTOS_CFG_RUNTIME_STATS
+/** The run time of every core's idle task added up: what the cores spent doing nothing. */
+static rtos_runtime_t idleRunTimeSum(void)
+{
+    rtos_runtime_t sum = rtos_tcbAry[RTOS_IDLE_TASK].runTime;
+    uint8_t c;
+    for(c = 1; c < RTOS_PORT_CORES; ++c)
+        sum += rtos_kernel_idleOf[c - 1u].runTime;
+    return sum;
+}
+
+static rtos_runtime_t _coreLoadRefTime[RTOS_PORT_CORES], _coreLoadRefIdle[RTOS_PORT_CORES];
+
+uint8_t rtos_getCoreLoad(uint8_t core)
+{
+    rtos_runtime_t total, idle, now, idleNow;
+    rtos_port_cs_t cs;
+
+    RTOS_CHECK(core < RTOS_PORT_CORES, core, RTOS_PORT_CORES);
+    cs = rtos_port_enterCritical();
+    accountRunTimeAll();
+    now = _lastSwitchTimeOf[core];
+    idleNow = idleOf(core)->runTime;
+    total = now - _coreLoadRefTime[core];
+    idle = idleNow - _coreLoadRefIdle[core];
+    _coreLoadRefTime[core] = now;
+    _coreLoadRefIdle[core] = idleNow;
+    rtos_port_exitCritical(cs);
+    return rtos_kernel_loadPercent(idle, total);
+}
+#endif
+
+uint8_t rtos_getCpuLoad(void)
+{
+#if RTOS_CFG_RUNTIME_STATS
+    rtos_runtime_t total, idle;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+#if RTOS_CFG_SMP
+    /* All cores: the idle time of every core against the interval times the core count,
+       so that 100 % means every core busy throughout. accountRunTimeAll leaves every
+       core's last switch time at now. */
+    accountRunTimeAll();
+    total = (_lastSwitchTimeOf[0] - _loadRefTime) * RTOS_PORT_CORES;
+    idle = idleRunTimeSum() - _loadRefIdle;
+    _loadRefTime = _lastSwitchTimeOf[0];
+    _loadRefIdle = idleRunTimeSum();
+#else
+    accountRunTime();
+    total = _lastSwitchTime - _loadRefTime;
+    idle = rtos_tcbAry[RTOS_IDLE_TASK].runTime - _loadRefIdle;
+    _loadRefTime = _lastSwitchTime;
+    _loadRefIdle = rtos_tcbAry[RTOS_IDLE_TASK].runTime;
+#endif
+    rtos_port_exitCritical(cs);
+    return rtos_kernel_loadPercent(idle, total);       /* outside the critical section */
+#else
+    return 0;
+#endif
+}
+
+
