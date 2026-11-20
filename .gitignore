@@ -1,0 +1,4 @@
+build/
+# OTA signing key of this machine (tools/ota_keygen.py) and the public key the selector embeds
+ota_key.pem
+boot/ota_pubkey.h

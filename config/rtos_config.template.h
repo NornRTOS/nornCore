@@ -1,0 +1,152 @@
+#ifndef RTOS_CONFIG_INCLUDED
+#define RTOS_CONFIG_INCLUDED
+/**
+ * @file rtos_config.template.h
+ * Copy this file to your application folder as rtos_config.h and adjust it. Only
+ * RTOS_CFG_NUM_TASKS is required; every other line below shows the kernel's default
+ * (kernel/rtos_types.h), so delete what you leave as it is, or keep the lines as the
+ * record of what the application runs with. The README's "Three configurations" has the
+ * measured small/default/large sets.
+ */
+
+/** Number of application tasks (the idle task is not counted). Each task gets a unique
+    priority 1..RTOS_CFG_NUM_TASKS; higher number means higher priority. Max 31. */
+#define RTOS_CFG_NUM_TASKS      3
+
+/** Tick frequency in Hz. Must divide F_CPU/64 exactly (1000 and 500 work at 16 MHz). */
+#define RTOS_CFG_TICK_HZ        1000ul
+
+/** Width of the tick counter: 16 or 32. 32 avoids false overrun detections. */
+#define RTOS_CFG_TICK_BITS      32
+
+/** Width of the per-task event flag vector: 8, 16 or 32. */
+#define RTOS_CFG_EVT_BITS       16
+
+/** AVR: which 16 bit timer drives the tick. Mega 2560: 1, 3, 4 or 5; UNO: only 1. Leave
+    it undefined to get 3 on the Mega and 1 on the UNO. Timer 0 and 2 are never used by
+    the kernel; hal/board.h offers timer 2 to the application. */
+/* #define RTOS_CFG_TIMER       3 */
+
+/** Fill stacks with a pattern at creation and support rtos_getStackFree; 0 also drops
+    the stack bookkeeping from the TCB (a pointer and a size per task). */
+#define RTOS_CFG_STACK_CHECK    1
+
+/** Stack monitor: the idle task watches the high water marks and calls
+    rtos_stackWarnHook once per task whose untouched margin drops below
+    RTOS_PORT_STACK_WARN. Needs RTOS_CFG_STACK_CHECK. */
+#define RTOS_CFG_STACK_WARN     1
+
+/** Let the idle task sleep (SLEEP_MODE_IDLE) between interrupts. */
+#define RTOS_CFG_IDLE_SLEEP     1
+
+/** Compile software timers (rtos_timer*). Costs one list check per tick. */
+#define RTOS_CFG_SW_TIMERS      1
+
+/** Measure run time per task at every context switch (rtos_getTaskRunTime,
+    rtos_getCpuLoad). Costs about 60 cycles per switch and 4 bytes per task. 2 also
+    counts the switches into each task (rtos_taskInfo_t.switches, nosh sched): one 16
+    bit increment per switch and 2 bytes per task more, and the locks that found a mutex
+    held (rtos_mutexContended, 0 in a correct ceiling configuration): 2 bytes per mutex. */
+#define RTOS_CFG_RUNTIME_STATS  1
+
+/** Compile kernel assertions. */
+#define RTOS_CFG_ASSERT         1
+
+/** 1: hal/hooks.c prints panics, failed assertions and stack warnings on the console
+    UART (through log.h), so the application needs no rtos_panicHook of its own. 0 keeps
+    the kernel's silent weak defaults for an application that defines its own hooks. */
+#define RTOS_CFG_HAL_HOOKS      0
+
+/* Stream buffers (rtos_stream_t): bytes of any length from one writer, a task or an
+   interrupt, to one reader, who is woken when a trigger level is reached. For a UART
+   driver or a network receive path. Its own file; nothing elsewhere changes. */
+#define RTOS_CFG_STREAMS        0
+
+/* 1: the console UART receives by interrupt into a stream buffer the application hands
+   to uart_setRxStream() (hal/uart.h); needs RTOS_CFG_STREAMS. nosh's console transport
+   uses it when it is on. On the AVR the receive interrupt is in the vector table, so the
+   image carries it whether the function is called or not (about 420 bytes). */
+#define UART_CFG_RX_STREAM      0
+
+/* Tasks that end (rtos_exit), slots reaped (rtos_reapTask) and filled again while the
+   system runs (rtos_startTask). 1 byte per task and an increment per mutex lock and
+   unlock; off, the kernel is the static one. */
+#define RTOS_CFG_DYNAMIC_TASKS  0
+
+/** Optional: a function void f(void) called in every idle loop iteration. Source builds
+    only; without it the kernel calls the weak function rtos_idleHook, which a binary
+    (SDK) application overrides instead. */
+/* #define RTOS_CFG_IDLE_HOOK   myIdleHook */
+
+/** 0: a panic halts the CPU (development). 1: it resets the board; the reason survives
+    the reset and is read with rtos_getLastPanic. */
+#define RTOS_CFG_PANIC_ACTION   0
+
+/** RTOS_CFG_STACK_CHECK 2 adds a canary at the bottom of every stack, checked before
+    each context switch and at each tick: an overflow becomes RTOS_PANIC_STACK_OVERFLOW. */
+
+/** Hardware stack guard (ESP32): a data breakpoint on the lowest 32 bytes of the running
+    task's stack, armed at every switch, so the first write there is the panic, at that
+    instruction, also inside a critical section; the canary finds it at the next switch
+    or tick, when the neighbour below may already be overwritten. Costs two special
+    register writes per switch and 32 byte stack alignment. Needs RTOS_CFG_STACK_CHECK;
+    the AVR has no such hardware and ignores it. OpenOCD uses the same breakpoints. */
+#if defined(__XTENSA__)
+# define RTOS_CFG_STACK_GUARD   1
+#endif
+
+/** Hardware watchdog kicked by the idle task plus per task check-ins (rtos_wdtInit,
+    rtos_wdtMonitor, rtos_wdtCheckIn). */
+#define RTOS_CFG_WATCHDOG       0
+
+/** AVR only: 1 makes rtos_port_reset use the watchdog, which needs a bootloader that
+    disables the watchdog at start; 0 jumps to the reset vector instead. */
+/* #define RTOS_CFG_AVR_RESET_VIA_WDT 0 */
+
+/** Where software timer callbacks run. 0: in the tick interrupt, with interrupts masked
+    for as long as the callback takes, so every callback adds to the system's interrupt
+    latency and may only use FromIsr functions; the lowest timer latency, and the only
+    choice where a task's stack does not fit (UNO). Above 0: in a kernel task of that
+    priority, created by rtos_start, free to use the whole API; the slot is taken from
+    RTOS_CFG_NUM_TASKS and the application leaves it free. The kernel's own default is 0;
+    this template starts with the task on everything but the UNO, the top slot here (an
+    application with nornWIFI, whose radio task takes the top slot, gives the timer task
+    the slot below the module tasks, or keeps 0: the adapter's callbacks are short).
+    RTOS_CFG_TIMER_TASK_STACK sets that task's stack size in bytes. */
+#if defined(__AVR_ATmega328P__)
+# define RTOS_CFG_TIMER_TASK_PRIO   0
+#else
+# define RTOS_CFG_TIMER_TASK_PRIO   RTOS_CFG_NUM_TASKS
+#endif
+
+/** Call rtos_traceHook at context switches, blocking, wake-ups, timers and panics. The
+    application provides the hook; hal/trace.h is a ring buffer recorder for it. */
+#define RTOS_CFG_TRACE          0
+
+/** Event groups: flags shared by several tasks (rtos_evgroup*). */
+#define RTOS_CFG_EVGROUPS       1
+
+/** Task notifications (rtos_notify*); 0 saves 2 bytes per task. */
+#define RTOS_CFG_NOTIFY         1
+
+/** rtos_suspend / rtos_resume. */
+#define RTOS_CFG_SUSPEND        1
+
+/** First fit heap with coalescing (rtos_heapInit, rtos_malloc, rtos_free). */
+#define RTOS_CFG_HEAP           0
+
+/** Tickless idle: the idle task sleeps until the next deadline instead of every tick.
+    ESP32 only; the AVR port ignores it. */
+#define RTOS_CFG_TICKLESS       0
+
+/** One kernel over all the port's cores (SMP, nornInternal/nornCore/smp_plan.md) instead of a kernel per
+    core (AMP). The default comes from the port: off up to two cores, on above. Ports: the
+    host (RTOS_HOST_CORES) and the ESP32. The one semantic difference to one core: a lower
+    priority task may run at the same time; shared variables need a mutex or a critical
+    section. Costs one spinlock per critical section; off, nothing is compiled. */
+/* #define RTOS_CFG_SMP         1 */
+/** With SMP: rtos_setAffinity() restricts a task to some cores (a driver whose interrupt
+    lives on one core). One AND per scheduling decision when on. */
+/* #define RTOS_CFG_SMP_AFFINITY 1 */
+
+#endif  /* RTOS_CONFIG_INCLUDED */
